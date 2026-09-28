@@ -1,0 +1,24 @@
+{
+  "name": "rein-backend",
+  "version": "1.0.0",
+  "description": "REIN Backend: GenLayer Transaction Abstraction and Neon DB",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "deploy": "node src/deploy.mjs",
+    "migrate": "node src/migrate.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@privy-io/server-auth": "^1.18.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2",
+    "genlayer-js": "^1.1.8",
+    "pg": "^8.13.3",
+    "undici": "^8.10.2"
+  }
+}
