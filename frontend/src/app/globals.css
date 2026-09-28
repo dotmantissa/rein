@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --rein-red: #eb1700;
+    --rein-dark: #191919;
+    --rein-surface: #1f1f1f;
+    --rein-border: #2a2a2a;
+    --rein-white: #ffffff;
+  }
+
+  body {
+    @apply font-sans antialiased;
+  }
+
+  /* Dark mode is default */
+  .dark body,
+  body {
+    @apply bg-rein-dark text-white/90;
+  }
+
+  .light body {
+    @apply bg-white text-rein-dark;
+  }
+}
+
+@layer components {
+  .rein-card {
+    @apply border border-rein-border bg-rein-surface rounded-sm;
+  }
+
+  .light .rein-card {
+    @apply border-rein-border-light bg-white;
+  }
+
+  .rein-btn-primary {
+    @apply bg-rein-red text-white font-mono text-sm px-4 py-2 rounded-sm
+           transition-colors duration-150
+           hover:bg-red-700 active:bg-red-800
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rein-red focus-visible:ring-offset-2 focus-visible:ring-offset-rein-dark;
+  }
+
+  .light .rein-btn-primary {
+    @apply focus-visible:ring-offset-white;
+  }
+
+  .rein-btn-secondary {
+    @apply border border-rein-border text-white/70 font-mono text-sm px-4 py-2 rounded-sm
+           transition-colors duration-150
+           hover:border-white/30 hover:text-white/90
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 focus-visible:ring-offset-2 focus-visible:ring-offset-rein-dark;
+  }
+
+  .light .rein-btn-secondary {
+    @apply border-rein-border-light text-rein-dark/70 hover:border-rein-dark/30 hover:text-rein-dark/90
+           focus-visible:ring-rein-dark/20 focus-visible:ring-offset-white;
+  }
+
+  .rein-input {
+    @apply bg-transparent border border-rein-border rounded-sm px-3 py-2 text-sm
+           text-white/90 placeholder:text-white/30
+           focus:outline-none focus:border-rein-red/50 focus:ring-1 focus:ring-rein-red/30
+           transition-colors duration-150;
+  }
+
+  .light .rein-input {
+    @apply border-rein-border-light text-rein-dark placeholder:text-rein-dark/30
+           focus:border-rein-red/50 focus:ring-rein-red/30;
+  }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Focus visible states */
+*:focus-visible {
+  @apply outline-2 outline-offset-2 outline-rein-red;
+}
+
+/* Scrollbar styling for dark mode */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-rein-dark;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-rein-border rounded-full;
+}
+
+.light ::-webkit-scrollbar-track {
+  @apply bg-white;
+}
+
+.light ::-webkit-scrollbar-thumb {
+  @apply bg-rein-border-light rounded-full;
+}
