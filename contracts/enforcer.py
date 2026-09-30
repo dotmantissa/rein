@@ -270,11 +270,36 @@ Return ONLY valid JSON:
                 sort_keys=True,
             )
 
-        comparison_prompt = """Compare appeal adjudication outputs.
-The "status" field must match EXACTLY (both OVERTURNED or both UPHELD).
-The "reasoning" may differ in wording as long as the conclusion agrees."""
+        # Judge the leader's ruling rather than have every validator re-run the
+        # adjudication. prompt_comparative costs each validator two prompts (its
+        # own ruling, then a comparison), which on StudioNet overran the
+        # validator execution budget: all of them voted timeout, the leader
+        # succeeded, the transaction settled as FINALIZED, and the state writes
+        # were dropped with nothing in the receipt to say so.
+        task = (
+            "An appeal judge was asked whether a revocation should be "
+            "OVERTURNED or UPHELD.\n\nMANDATE:\n"
+            + clean_mandate
+            + "\n\nFLAGGED ACTION:\n"
+            + (clean_action if clean_action else "No description provided")
+            + "\n\nOPERATOR'S APPEAL:\n"
+            + (str(appeal_reason) if appeal_reason else "No reason given")
+        )
 
-        result_str = gl.eq_principle.prompt_comparative(_rejudge, comparison_prompt)
+        criteria = (
+            "The output must be a JSON object whose 'status' is exactly "
+            "\"OVERTURNED\" or \"UPHELD\", with a 'reasoning' string.\n\n"
+            "Accept the output only if the reasoning engages with the mandate, "
+            "the flagged action and the appeal above, and the status follows from "
+            "it. Reject a ruling that contradicts its own reasoning, invents "
+            "facts absent from the material above, or ignores the appeal "
+            "entirely. Wording is not a reason to reject, and a defensible "
+            "judgement you would have decided differently is still acceptable."
+        )
+
+        result_str = gl.eq_principle.prompt_non_comparative(
+            _rejudge, task=task, criteria=criteria
+        )
 
         try:
             result = _parse_llm_json(result_str)

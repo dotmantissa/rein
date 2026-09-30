@@ -88,7 +88,9 @@ async function waitForState(read, predicate, budgetMs = READBACK_BUDGET_MS) {
     const hit = predicate(last);
     if (hit) return hit;
     if (Date.now() >= deadline) return null;
-    await new Promise((r) => setTimeout(r, 3000));
+    // Ten seconds, not three: StudioNet allows 500 RPC requests an hour and a
+    // tighter loop spends the whole budget on a single waiting request.
+    await new Promise((r) => setTimeout(r, 10000));
   }
 }
 

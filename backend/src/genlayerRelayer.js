@@ -19,7 +19,11 @@ const DEPLOYER =
   "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53";
 const PRIV_KEY = process.env.GENLAYER_PRIVATE_KEY;
 
-const POLL_MS = Number(process.env.GENLAYER_POLL_MS || 3000);
+// StudioNet rate-limits a client to 500 RPC requests per hour. Polling every
+// three seconds spends 1200 an hour on a single waiting request, which exhausts
+// the budget and then fails every call with -32029 for the rest of the window.
+// Ten seconds keeps a long wait affordable.
+const POLL_MS = Number(process.env.GENLAYER_POLL_MS || 10000);
 
 // How long a single request may spend waiting for consensus. On a long-running
 // host this can be generous; on a serverless host it must stay inside the

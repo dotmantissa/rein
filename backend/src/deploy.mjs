@@ -168,6 +168,35 @@ async function main() {
     JSON.stringify(addresses, null, 2)
   );
   console.log(`\nAddresses written to ${addressFile}`);
+
+  // Also rewrite .env, which is what the server and every script actually read.
+  // Writing only the JSON file left the backend pointed at the previous
+  // deployment, so a redeploy appeared to succeed while every call afterwards
+  // still ran the old bytecode.
+  const envFile = new URL("../.env", import.meta.url).pathname;
+  const keys = {
+    MANDATE_REGISTRY_ADDRESS: addresses.mandateRegistry,
+    REIN_COURT_ADDRESS: addresses.reinCourt,
+    ENFORCER_ADDRESS: addresses.enforcer,
+  };
+  let env = "";
+  try {
+    env = readFileSync(envFile, "utf8");
+  } catch {
+    console.warn(`\nNo .env at ${envFile}; skipping env update.`);
+    return;
+  }
+  for (const [k, v] of Object.entries(keys)) {
+    const line = `${k}=${v}`;
+    const re = new RegExp(`^${k}=.*$`, "m");
+    env = re.test(env) ? env.replace(re, line) : `${env.replace(/\n*$/, "\n")}${line}\n`;
+  }
+  writeFileSync(envFile, env);
+  console.log(`Addresses written to ${envFile}`);
+  console.log(
+    "\nRemember to update the deployed backend's environment too, or it will " +
+      "keep calling the previous contracts."
+  );
 }
 
 main().catch((err) => {

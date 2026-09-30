@@ -67,7 +67,9 @@ function ReviewContent() {
       let settled = res;
 
       while (settled.status !== 'REVIEWED' && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 5000));
+        // StudioNet allows 500 RPC requests an hour across the whole backend,
+        // so poll gently rather than every few seconds.
+        await new Promise((r) => setTimeout(r, 10000));
         const elapsed = Math.round((Date.now() - (deadline - 5 * 60 * 1000)) / 1000);
         setProgress(`Waiting for consensus... ${elapsed}s elapsed (typically 50-90s)`);
         try {

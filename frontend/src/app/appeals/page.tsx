@@ -80,7 +80,7 @@ function AppealsContent() {
       // submit above only broadcasts. Poll until the ruling is on chain.
       const deadline = Date.now() + 5 * 60 * 1000;
       for (;;) {
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, 10000));
         let status = 'ADJUDICATING';
         try {
           status = (await api.getAppealStatus(token, appealId)).status;

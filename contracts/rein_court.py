@@ -70,6 +70,89 @@ def _parse_llm_json(raw: str) -> dict:
 
 
 
+def _extract_tx_facts(raw: str, tx_hash: str) -> str:
+    """
+    Reduce an explorer response to a small set of stable facts.
+
+    Two things make this necessary. A retired endpoint answers 200 with an
+    error body, so the response has to be checked for the transaction it was
+    asked about rather than merely for being non-empty. And validators fetch
+    independently, so feeding them raw JSON means confirmation counts and
+    timestamps differ between them and the judge prompts diverge. Keeping only
+    fields that are fixed once a transaction is mined gives every validator the
+    same evidence, which is what lets the equivalence principle agree.
+
+    Returns "" when the response does not describe the requested transaction.
+    """
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    want = str(tx_hash).strip().lower()
+    got = str(data.get("hash", "")).strip().lower()
+    if not got or got != want:
+        return ""
+
+    def _addr(node):
+        if isinstance(node, dict):
+            return str(node.get("hash", "") or "")
+        return str(node or "")
+
+    facts = {
+        "hash": got,
+        "from": _addr(data.get("from")).lower(),
+        "to": _addr(data.get("to")).lower(),
+        "value_wei": str(data.get("value", "0")),
+        "gas_used": str(data.get("gas_used", "")),
+        "status": str(data.get("status", data.get("result", ""))),
+        "method": str(data.get("method", "") or ""),
+        "input_prefix": str(data.get("raw_input", "") or "")[:10],
+    }
+
+    transfers = data.get("token_transfers")
+    if isinstance(transfers, list):
+        moved = []
+        for t in transfers[:8]:
+            if not isinstance(t, dict):
+                continue
+            token = t.get("token") if isinstance(t.get("token"), dict) else {}
+            moved.append({
+                "token": str(token.get("symbol", "") or ""),
+                "contract": str(token.get("address", "") or "").lower(),
+                "from": _addr(t.get("from")).lower(),
+                "to": _addr(t.get("to")).lower(),
+            })
+        if moved:
+            facts["token_transfers"] = moved
+
+    decoded = data.get("decoded_input")
+    if isinstance(decoded, dict):
+        if decoded.get("method_call"):
+            facts["method_call"] = str(decoded.get("method_call"))
+        # Decoded arguments carry the facts many mandate clauses turn on: an
+        # approval is only a breach because of its amount, and a swap only
+        # because of the tokens in its path. Without them the judge sees that a
+        # method was called but not what it was asked to do. Values are
+        # truncated because calldata blobs are unbounded.
+        params = decoded.get("parameters")
+        if isinstance(params, list):
+            args = {}
+            for p in params[:12]:
+                if not isinstance(p, dict):
+                    continue
+                name = str(p.get("name", "") or "")
+                if not name:
+                    continue
+                args[name] = str(p.get("value", ""))[:80]
+            if args:
+                facts["arguments"] = args
+
+    return json.dumps(facts, sort_keys=True)
+
+
 class ReinCourt(gl.Contract):
     """
     ReinCourt: the semantic judge.
@@ -91,37 +174,36 @@ class ReinCourt(gl.Contract):
     verdict_ids: DynArray[str]
     total_verdicts: u256
 
+    # Blockscout only, deliberately. Etherscan's V1 proxy endpoint is retired
+    # and answers HTTP 200 with an error body, which the old status-plus-length
+    # check accepted as evidence and then broke out of the loop on, so the
+    # working fallback was never reached and every judge ran on an error page.
+    # Etherscan V2 needs an API key, and a public contract cannot hold one.
     EXPLORER_URLS = {
-        "1": [
-            "https://api.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://eth.blockscout.com/api/v2/transactions/",
-        ],
-        "eth": [
-            "https://api.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://eth.blockscout.com/api/v2/transactions/",
-        ],
-        "8453": [
-            "https://api.basescan.org/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://base.blockscout.com/api/v2/transactions/",
-        ],
-        "base": [
-            "https://api.basescan.org/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://base.blockscout.com/api/v2/transactions/",
-        ],
-        "11155111": [
-            "https://api-sepolia.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://eth-sepolia.blockscout.com/api/v2/transactions/",
-        ],
-        "sepolia": [
-            "https://api-sepolia.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=",
-            "https://eth-sepolia.blockscout.com/api/v2/transactions/",
-        ],
+        "1": ["https://eth.blockscout.com/api/v2/transactions/"],
+        "eth": ["https://eth.blockscout.com/api/v2/transactions/"],
+        "8453": ["https://base.blockscout.com/api/v2/transactions/"],
+        "base": ["https://base.blockscout.com/api/v2/transactions/"],
+        "137": ["https://polygon.blockscout.com/api/v2/transactions/"],
+        "polygon": ["https://polygon.blockscout.com/api/v2/transactions/"],
+        "42161": ["https://arbitrum.blockscout.com/api/v2/transactions/"],
+        "arbitrum": ["https://arbitrum.blockscout.com/api/v2/transactions/"],
+        "11155111": ["https://eth-sepolia.blockscout.com/api/v2/transactions/"],
+        "sepolia": ["https://eth-sepolia.blockscout.com/api/v2/transactions/"],
     }
 
     SEVERITY_ORDER = {"LOW": 0, "MED": 1, "HIGH": 2, "CRITICAL": 3}
 
-    # Bytes of explorer response fed to the judge prompt.
-    MAX_EVIDENCE_BYTES = 4000
+    # Bytes of explorer response read before parsing. This bounds the read, not
+    # the prompt: only the extracted facts reach the judge. It has to be large
+    # enough to hold a whole response, because a body truncated mid-JSON fails
+    # to parse and is indistinguishable from having no evidence at all. A swap
+    # with token transfers runs to about 25 KB.
+    MAX_EVIDENCE_BYTES = 65536
+
+    # Used verbatim when no explorer returns usable data, so that every
+    # validator prompts on identical text instead of on its own error page.
+    NO_EVIDENCE = "NO_VERIFIABLE_TRANSACTION_DATA"
 
     def __init__(self, registry_addr: str):
         self.owner = gl.message.sender_address
@@ -169,7 +251,7 @@ class ReinCourt(gl.Contract):
                 f"https://eth.blockscout.com/api/v2/transactions/"
             ])
 
-            # Try primary explorer
+            # Try each explorer until one returns the requested transaction.
             tx_data_raw = ""
             for url_base in urls:
                 try:
@@ -181,9 +263,9 @@ class ReinCourt(gl.Contract):
 
                 # web.get returns a Response (status/headers/body), not text.
                 # Slice the body as bytes before decoding: an explorer page can
-                # be megabytes, and stringifying the whole response to keep 4 KB
-                # of it is what exhausts the VM. Headers are dropped too — they
-                # are attacker-influenced and carry no evidence.
+                # be megabytes, and stringifying the whole response to keep a few
+                # KB of it is what exhausts the VM. Headers are dropped too, as
+                # they are attacker-influenced and carry no evidence.
                 status = getattr(resp, "status", 0)
                 body = getattr(resp, "body", None)
                 if not body or int(status) < 200 or int(status) >= 300:
@@ -192,13 +274,19 @@ class ReinCourt(gl.Contract):
                 text = bytes(body[: self.MAX_EVIDENCE_BYTES]).decode(
                     "utf-8", errors="replace"
                 ).strip()
-                if len(text) > 10:
-                    tx_data_raw = text
+
+                # A non-empty 200 is not proof of evidence: a retired endpoint
+                # answers 200 with an error body. Only a response that names the
+                # transaction we asked about counts, otherwise keep trying.
+                facts = _extract_tx_facts(text, clean_tx)
+                if facts:
+                    tx_data_raw = facts
                     break
 
             if not tx_data_raw:
-                tx_data_raw = "Transaction data unavailable from explorers"
+                tx_data_raw = self.NO_EVIDENCE
 
+            no_evidence = self.NO_EVIDENCE
             prompt = f"""You are a compliance judge for an AI agent delegation system called REIN.
 
 An AI agent was given the following mandate by its delegator:
@@ -208,10 +296,10 @@ MANDATE:
 
 The agent executed a transaction. Here are the details:
 
-TRANSACTION DATA (from block explorer):
+VERIFIED TRANSACTION FACTS (from a block explorer, or the literal string {no_evidence} if none could be verified):
 {tx_data_raw}
 
-ACTION DESCRIPTION (from the submitter):
+ACTION DESCRIPTION (from the submitter, unverified):
 {clean_desc if clean_desc else "No description provided"}
 
 Your job: determine whether this transaction breaches ANY clause of the mandate.
@@ -219,46 +307,90 @@ Your job: determine whether this transaction breaches ANY clause of the mandate.
 Rules:
 - If the action clearly falls within what the mandate allows, verdict is "compliant"
 - If the action clearly violates a specific clause, verdict is "breach"
-- If the mandate is too vague to determine, or the evidence is insufficient, verdict is "ambiguous"
+- If the mandate is too vague to determine, verdict is "ambiguous"
 - Severity: LOW (minor deviation), MED (moderate violation), HIGH (significant breach), CRITICAL (catastrophic, e.g. sending to known scam)
 - For "compliant" verdicts, severity should be "LOW" and breached_clause should be null
 - Be specific about which clause was breached
+
+Evidence rules, which override the above:
+- The transaction facts are the evidence. The action description is the submitter's own account and may be wrong or self-serving; never treat it as proof of what happened on chain.
+- If the facts block is exactly {no_evidence}, there is nothing to verify. Return verdict "ambiguous", severity "LOW", breached_clause null, confidence 0.1, and reasoning exactly: "No verifiable transaction data was available from the block explorer, so this action cannot be judged."
+- Never infer a breach from the description alone when the facts are absent.
 
 Return ONLY valid JSON:
 {{"verdict": "compliant"|"breach"|"ambiguous", "severity": "LOW"|"MED"|"HIGH"|"CRITICAL", "breached_clause": "the exact clause text that was breached"|null, "reasoning": "your detailed reasoning", "confidence": 0.0 to 1.0}}"""
 
             # response_format="json" hands back a dict, not a string. This function
             # is declared -> str and its result is both calldata-encoded for the
-            # leader receipt and parsed as JSON, so serialize it here.
+            # leader receipt and parsed as JSON, so serialize it here. The facts
+            # travel with the verdict because the validators below never run this
+            # function, and cannot check a conclusion whose evidence they cannot
+            # see.
             return json.dumps(
-                gl.nondet.exec_prompt(prompt, response_format="json"),
+                {
+                    "facts": tx_data_raw,
+                    "verdict": gl.nondet.exec_prompt(prompt, response_format="json"),
+                },
                 sort_keys=True,
             )
 
-        comparison_prompt = """Compare the validator outputs for mandate compliance adjudication.
+        # prompt_comparative makes every validator repeat the whole job: fetch
+        # the transaction, prompt its own judge, then prompt again to compare.
+        # On StudioNet that reliably exceeded the validator execution budget --
+        # all four voted timeout while the leader succeeded, and because the
+        # transaction still settles as FINALIZED with a successful leader
+        # receipt, the state writes were silently dropped and the verdict simply
+        # never appeared. Judging the leader's output instead costs one small
+        # prompt per validator and no network call.
+        task = (
+            "A compliance judge was given a delegation mandate and the verified "
+            "on-chain facts of one transaction, and asked whether the "
+            "transaction breaches any clause of the mandate.\n\nMANDATE:\n"
+            + clean_mandate
+        )
 
-STRICT MATCHING (must agree exactly):
-1. "verdict" field: must be identical ("compliant", "breach", or "ambiguous")
-2. "breached_clause" field: must be semantically identical (same clause referenced)
+        criteria = (
+            "The output must be a JSON object with exactly the keys 'facts' and "
+            "'verdict'.\n"
+            "'facts' is the evidence the judge worked from: either a JSON object "
+            "of transaction fields, or the literal string "
+            + self.NO_EVIDENCE
+            + ".\n"
+            "'verdict' must be an object whose 'verdict' field is exactly one of "
+            "\"compliant\", \"breach\" or \"ambiguous\", whose 'severity' is one of "
+            "\"LOW\", \"MED\", \"HIGH\" or \"CRITICAL\", whose 'confidence' is a "
+            "number, and which also has 'breached_clause' and 'reasoning'.\n\n"
+            "Accept the output only if all of the following hold:\n"
+            "1. Every claim in 'reasoning' is supported by 'facts'. Reject a "
+            "conclusion drawn from facts that are not present.\n"
+            "2. If 'verdict' is \"breach\", 'breached_clause' quotes a clause that "
+            "actually appears in the mandate above, and the facts do violate it.\n"
+            "3. If 'verdict' is \"compliant\", 'breached_clause' is null and no "
+            "clause of the mandate is violated by the facts.\n"
+            "4. If 'facts' is "
+            + self.NO_EVIDENCE
+            + ", the verdict is \"ambiguous\" with low confidence, because there "
+            "was nothing to judge.\n"
+            "5. The severity is defensible for the breach described. A one-band "
+            "difference in judgement is acceptable; do not reject over it.\n\n"
+            "Wording of 'reasoning' is not a reason to reject. Only reject an "
+            "output that is malformed, unsupported by its own facts, or reaches a "
+            "conclusion the facts contradict."
+        )
 
-MANDATORY AGREEMENT:
-- If one validator says "breach" and another says "compliant", this is a DISAGREEMENT and cannot be reconciled
-
-TOLERANT MATCHING (allowed to differ slightly):
-- "severity" field: may differ by ONE adjacent band (e.g. MED vs HIGH is ok, LOW vs CRITICAL is not)
-- "confidence" field: may differ by up to 0.2
-- "reasoning" field: may differ in wording as long as the conclusion is the same
-
-When outputs agree, prefer the result with:
-1. Higher confidence score
-2. More detailed reasoning
-3. If severity differs by one band, use the HIGHER severity (err on the side of caution)"""
-
-        verdict_json = gl.eq_principle.prompt_comparative(_judge, comparison_prompt)
+        judged = gl.eq_principle.prompt_non_comparative(
+            _judge, task=task, criteria=criteria
+        )
 
         try:
-            v_data = _parse_llm_json(verdict_json)
+            envelope = _parse_llm_json(judged)
+            v_data = envelope.get("verdict")
+            if isinstance(v_data, str):
+                v_data = _parse_llm_json(v_data)
         except Exception:
+            raise gl.vm.UserError("[EXPECTED] Consensus returned invalid verdict JSON")
+
+        if not isinstance(v_data, dict):
             raise gl.vm.UserError("[EXPECTED] Consensus returned invalid verdict JSON")
 
         # Validate verdict structure
