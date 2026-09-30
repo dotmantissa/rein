@@ -25,18 +25,18 @@ def test_initial_state():
 def test_review_action_stores_verdict():
     court = make_court()
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
 
     # Mock the web fetch and prompt
-    mock_gl.nondet.web.get.return_value = '{"result": {"from": "0xAgent", "to": "0xTarget", "value": "0x100"}}'
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    mock_gl.nondet.web.get.return_value = FakeResponse('{"result": {"from": "0xAgent", "to": "0xTarget", "value": "0x100"}}')
+    mock_gl.nondet.exec_prompt.return_value = ({
         "verdict": "compliant",
         "severity": "LOW",
         "breached_clause": None,
         "reasoning": "Action is within mandate scope",
         "confidence": 0.95,
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     result = court.review_action(
         "del_001", "0xTxHash123", "1", "Bought compute credits", "Buy compute for research only"
@@ -53,17 +53,17 @@ def test_review_action_stores_verdict():
 def test_review_action_breach():
     court = make_court()
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
 
-    mock_gl.nondet.web.get.return_value = '{"result": {"from": "0xAgent", "to": "0xAdPlatform"}}'
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    mock_gl.nondet.web.get.return_value = FakeResponse('{"result": {"from": "0xAgent", "to": "0xAdPlatform"}}')
+    mock_gl.nondet.exec_prompt.return_value = ({
         "verdict": "breach",
         "severity": "HIGH",
         "breached_clause": "never pay for ads",
         "reasoning": "Transaction sent funds to an advertising platform",
         "confidence": 0.92,
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     result = court.review_action(
         "del_002", "0xTxHash456", "8453", "Bought ad placement", "Buy compute for research, never pay for ads"
@@ -102,17 +102,17 @@ def test_get_verdict_not_found():
 def test_get_verdict_retrieves_stored():
     court = make_court()
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
 
-    mock_gl.nondet.web.get.return_value = '{"result": {}}'
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    mock_gl.nondet.web.get.return_value = FakeResponse('{"result": {}}')
+    mock_gl.nondet.exec_prompt.return_value = ({
         "verdict": "ambiguous",
         "severity": "LOW",
         "breached_clause": None,
         "reasoning": "Insufficient evidence",
         "confidence": 0.5,
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     result = court.review_action("del_x", "0xTx", "1", "something", "do stuff")
     v = json.loads(result)
@@ -126,14 +126,14 @@ def test_get_verdict_retrieves_stored():
 def test_get_verdicts_by_delegation():
     court = make_court()
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
 
-    mock_gl.nondet.web.get.return_value = '{"result": {}}'
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    mock_gl.nondet.web.get.return_value = FakeResponse('{"result": {}}')
+    mock_gl.nondet.exec_prompt.return_value = ({
         "verdict": "compliant", "severity": "LOW",
         "breached_clause": None, "reasoning": "ok", "confidence": 0.9,
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     court.review_action("del_A", "0xTx1", "1", "action 1", "mandate A")
     court.review_action("del_B", "0xTx2", "1", "action 2", "mandate B")
@@ -148,14 +148,14 @@ def test_get_verdicts_by_delegation():
 def test_get_recent_verdicts():
     court = make_court()
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
 
-    mock_gl.nondet.web.get.return_value = '{"result": {}}'
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    mock_gl.nondet.web.get.return_value = FakeResponse('{"result": {}}')
+    mock_gl.nondet.exec_prompt.return_value = ({
         "verdict": "compliant", "severity": "LOW",
         "breached_clause": None, "reasoning": "ok", "confidence": 0.9,
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     for i in range(5):
         court.review_action(f"del_{i}", f"0xTx{i}", "1", f"action {i}", "mandate")
@@ -168,8 +168,16 @@ def test_get_recent_verdicts():
 
 def test_explorer_url_selection():
     court = make_court()
-    # Verify the EXPLORER_URLS mapping exists for known chains
-    assert "1" in court.EXPLORER_URLS
-    assert "8453" in court.EXPLORER_URLS
-    assert "11155111" in court.EXPLORER_URLS
-    assert len(court.EXPLORER_URLS["1"]) == 2  # Two explorers per chain
+    # Every chain the UI offers must be resolvable.
+    for chain in ("1", "8453", "137", "42161", "11155111"):
+        assert chain in court.EXPLORER_URLS, chain
+        assert court.EXPLORER_URLS[chain], chain
+
+    # Blockscout only. Etherscan's V1 proxy endpoint is retired and answers 200
+    # with an error body, which the fetch loop accepted as evidence and then
+    # stopped on, so the judge only ever saw an error page.
+    for chain, urls in court.EXPLORER_URLS.items():
+        for url in urls:
+            assert "blockscout.com" in url, (chain, url)
+            assert "etherscan" not in url, (chain, url)
+            assert "basescan" not in url, (chain, url)

@@ -301,8 +301,13 @@ Return ONLY valid JSON:
             _rejudge, task=task, criteria=criteria
         )
 
+        # exec_prompt(response_format="json") returns a dict, which _rejudge
+        # serializes. Tolerate a runner that hands back a string anyway, rather
+        # than double-decoding a value that is already an object.
         try:
             result = _parse_llm_json(result_str)
+            if isinstance(result, str):
+                result = _parse_llm_json(result)
         except Exception:
             raise gl.vm.UserError(
                 "[EXPECTED] Consensus returned invalid appeal adjudication JSON"

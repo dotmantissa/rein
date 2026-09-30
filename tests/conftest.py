@@ -30,3 +30,28 @@ _mod.DynArray = list
 _mod.u256 = int
 _mod.__all__ = ["gl", "Address", "TreeMap", "DynArray", "u256"]
 sys.modules["genlayer"] = _mod
+
+
+class FakeResponse:
+    """
+    Stand-in for what gl.nondet.web.get returns.
+
+    The contract reads .status and slices .body as bytes. A plain string has
+    neither, so a test that mocks web.get with a string silently exercises the
+    no-evidence path instead of the parsing it means to check.
+    """
+
+    def __init__(self, body, status=200):
+        self.status = status
+        self.body = body if isinstance(body, bytes) else str(body).encode()
+        self.headers = {}
+
+
+def judge_leader_only(fn, task=None, criteria=None):
+    """
+    Stand in for gl.eq_principle.prompt_non_comparative.
+
+    Direct execution runs the leader only, which is what this returns. Validator
+    behaviour is not reproducible here and belongs in an integration test.
+    """
+    return fn()

@@ -123,7 +123,7 @@ def test_record_evm_revocation_unauthorized():
     r = json.loads(result)
     rev_id = r["revocation_id"]
 
-    from tests.conftest import mock_gl
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
     original = mock_gl.message.sender_address
     mock_gl.message.sender_address = "not_owner"
 
@@ -176,12 +176,12 @@ def test_adjudicate_appeal_overturned():
     enf.file_appeal(rev_id, "Was within mandate spirit", "1000")
     appeal_id = json.loads(enf.get_all_appeals())[0]["appeal_id"]
 
-    from tests.conftest import mock_gl
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
+    mock_gl.nondet.exec_prompt.return_value = ({
         "status": "OVERTURNED",
         "reasoning": "The action was indeed within the spirit of the mandate",
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     result = enf.adjudicate_appeal(appeal_id, "Buy compute only", "Bought GPU time")
     a = json.loads(result)
@@ -195,12 +195,12 @@ def test_adjudicate_appeal_upheld():
     enf.file_appeal(rev_id, "It was research adjacent", "2000")
     appeal_id = json.loads(enf.get_all_appeals())[0]["appeal_id"]
 
-    from tests.conftest import mock_gl
-    mock_gl.nondet.exec_prompt.return_value = json.dumps({
+    from tests.conftest import mock_gl, FakeResponse, judge_leader_only
+    mock_gl.nondet.exec_prompt.return_value = ({
         "status": "UPHELD",
         "reasoning": "The agent clearly violated the ads prohibition",
     })
-    mock_gl.eq_principle.prompt_comparative.side_effect = lambda fn, prompt: fn()
+    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
 
     result = enf.adjudicate_appeal(appeal_id, "Never pay for ads", "Bought ad placement")
     a = json.loads(result)
