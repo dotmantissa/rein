@@ -49,7 +49,10 @@ export const api = {
     tx_hash: string;
     chain_id?: string;
     action_description?: string;
-  }) => fetchApi<{ action_id: string; verdict: any; revocation: any; genlayer_tx_hash: string }>('/api/actions/review', token, { method: 'POST', body: JSON.stringify(data) }),
+  }) => fetchApi<{ action_id: string; status: string; verdict: any; revocation: any; genlayer_tx_hash: string }>('/api/actions/review', token, { method: 'POST', body: JSON.stringify(data) }),
+
+  getActionStatus: (token: string, actionId: string) =>
+    fetchApi<{ action_id: string; status: string; verdict: any; revocation: any; genlayer_tx_hash: string }>(`/api/actions/${actionId}/status`, token),
 
   // Verdicts
   getVerdicts: (token: string) =>
@@ -71,6 +74,9 @@ export const api = {
 
   adjudicateAppeal: (token: string, appealId: string) =>
     fetchApi<{ appeal_id: string; status: string; genlayer_tx_hash: string }>(`/api/appeals/${appealId}/adjudicate`, token, { method: 'POST', body: JSON.stringify({}) }),
+
+  getAppealStatus: (token: string, appealId: string) =>
+    fetchApi<{ appeal_id: string; status: string; adjudication: any; genlayer_tx_hash: string }>(`/api/appeals/${appealId}/status`, token),
 
   getAppeals: (token: string) =>
     fetchApi<{ appeals: any[] }>('/api/appeals', token),

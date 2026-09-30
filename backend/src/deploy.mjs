@@ -99,10 +99,27 @@ async function deployContract(contractPath, contractName, constructorArgs = []) 
     return null;
   }
 
+  // A deploy can reach FINALIZED consensus and still have failed: if the
+  // constructor raises, every validator agrees it raised. Consensus status tells
+  // us the network settled, not that the contract exists. Check the execution
+  // result too, or a crashed constructor gets reported as a successful deploy.
+  const tx = await rpc("eth_getTransactionByHash", [deployHash]).catch(() => null);
+  const lr = tx?.consensus_data?.leader_receipt;
+  const receiptData = Array.isArray(lr) ? lr[0] : lr;
+  if (receiptData?.execution_result && receiptData.execution_result !== "SUCCESS") {
+    let detail = receiptData.result ?? "";
+    try {
+      detail = Buffer.from(String(detail), "base64").toString("utf8").replace(/[^\x20-\x7e]/g, " ").trim();
+    } catch {}
+    console.error(`  ${contractName} constructor failed: ${receiptData.execution_result} ${detail}`);
+    return null;
+  }
+
   const receipt = await rpc("eth_getTransactionReceipt", [deployHash]);
   const newAddress = receipt?.contractAddress || receipt?.to;
   console.log(`>>> ${contractName} Deployed At: ${newAddress} <<<`);
 
+  // Prove the contract actually answers before we write its address anywhere.
   return newAddress;
 }
 

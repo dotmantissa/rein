@@ -4,6 +4,45 @@ from genlayer import *
 import json
 
 
+def _parse_llm_json(raw: str) -> dict:
+    """
+    Parse a JSON object out of an LLM's answer.
+
+    `prompt_comparative` hands back the winning validator's text verbatim, and
+    models routinely wrap JSON in a markdown fence or add a sentence either side
+    of it even when asked not to. Treating that as a hard failure throws away a
+    verdict the validators already agreed on, so recover the object instead:
+    strip any fence, then fall back to the outermost brace pair.
+    """
+    if isinstance(raw, dict):
+        return raw
+
+    text = str(raw).strip()
+
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
+        fence = text.rfind("```")
+        if fence != -1:
+            text = text[:fence]
+        text = text.strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(text[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise ValueError("expected a JSON object")
+    return parsed
+
+
+
 class Enforcer(gl.Contract):
     """
     Enforcer: holds the revocation authority.
@@ -35,8 +74,8 @@ class Enforcer(gl.Contract):
 
     def __init__(self, court_addr: str, registry_addr: str):
         self.owner = gl.message.sender_address
-        self.court_address = str(court_addr).strip()
-        self.registry_address = str(registry_addr).strip()
+        self.court_address = Address(str(court_addr).strip())
+        self.registry_address = Address(str(registry_addr).strip())
         self.total_revocations = u256(0)
         self.total_appeals = u256(0)
 
@@ -223,7 +262,13 @@ Consider:
 Return ONLY valid JSON:
 {{"status": "OVERTURNED"|"UPHELD", "reasoning": "your detailed reasoning"}}"""
 
-            return gl.nondet.exec_prompt(prompt, response_format="json")
+            # response_format="json" hands back a dict, not a string. This function
+            # is declared -> str and its result is both calldata-encoded for the
+            # leader receipt and parsed as JSON, so serialize it here.
+            return json.dumps(
+                gl.nondet.exec_prompt(prompt, response_format="json"),
+                sort_keys=True,
+            )
 
         comparison_prompt = """Compare appeal adjudication outputs.
 The "status" field must match EXACTLY (both OVERTURNED or both UPHELD).
@@ -232,7 +277,7 @@ The "reasoning" may differ in wording as long as the conclusion agrees."""
         result_str = gl.eq_principle.prompt_comparative(_rejudge, comparison_prompt)
 
         try:
-            result = json.loads(result_str)
+            result = _parse_llm_json(result_str)
         except Exception:
             raise gl.vm.UserError(
                 "[EXPECTED] Consensus returned invalid appeal adjudication JSON"

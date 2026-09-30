@@ -19,8 +19,14 @@ const DEPLOYER =
   "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53";
 const PRIV_KEY = process.env.GENLAYER_PRIVATE_KEY;
 
-const POLL_MS = 3000;
-const MAX_POLLS = 80;
+const POLL_MS = Number(process.env.GENLAYER_POLL_MS || 3000);
+
+// How long a single request may spend waiting for consensus. On a long-running
+// host this can be generous; on a serverless host it must stay inside the
+// platform's function ceiling or the caller gets a 504 with no tx hash to
+// recover from. Bounded by wall clock, not poll count, so tuning POLL_MS can
+// never change the worst-case request duration.
+const FINALITY_BUDGET_MS = Number(process.env.GENLAYER_FINALITY_BUDGET_MS || 240000);
 
 async function rpc(method, params = []) {
   const res = await fetch(RPC_URL, {
@@ -76,9 +82,13 @@ function getClient() {
   return _client;
 }
 
-export async function pollTxFinality(hash) {
-  for (let i = 0; i < MAX_POLLS; i++) {
-    await new Promise((r) => setTimeout(r, POLL_MS));
+export async function pollTxFinality(hash, { budgetMs = FINALITY_BUDGET_MS } = {}) {
+  // A zero budget means the caller only wanted the transaction broadcast and
+  // will confirm the outcome by reading contract state instead.
+  if (budgetMs <= 0) return { status: "submitted", rawStatus: "SUBMITTED" };
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, Math.min(POLL_MS, Math.max(0, deadline - Date.now()))));
     try {
       const tx = await rpc("eth_getTransactionByHash", [hash]).catch(
         () => null
@@ -106,8 +116,19 @@ export async function pollTxFinality(hash) {
 
 /**
  * Write to a GenLayer contract and wait for finality.
+ *
+ * `budgetMs` caps the wait. If consensus has not landed by then the behaviour
+ * depends on `requireFinality`: the default throws (callers that cannot act on
+ * a half-finished write), while `false` returns the broadcast hash with a
+ * non-finalized status so the caller can persist it and reconcile later. The
+ * transaction is already on the network either way — only our patience ran out.
  */
-export async function writeContract(address, functionName, args = []) {
+export async function writeContract(
+  address,
+  functionName,
+  args = [],
+  { budgetMs = FINALITY_BUDGET_MS, requireFinality = true } = {}
+) {
   const client = getClient();
   console.log(
     `[Relayer] Writing ${functionName} to ${address} with args:`,
@@ -122,11 +143,20 @@ export async function writeContract(address, functionName, args = []) {
   });
   console.log(`[Relayer] Broadcast tx: ${txHash}`);
 
-  const finality = await pollTxFinality(txHash);
+  const finality = await pollTxFinality(txHash, { budgetMs });
+  if (finality.status === "submitted") {
+    return { txHash, finality };
+  }
   if (finality.status !== "finalized") {
-    throw new Error(
-      `Transaction ${txHash} did not finalize (status: ${finality.status})`
+    if (requireFinality) {
+      throw new Error(
+        `Transaction ${txHash} did not finalize (status: ${finality.status})`
+      );
+    }
+    console.warn(
+      `[Relayer] ${txHash} still ${finality.status} after ${budgetMs}ms; returning unfinalized`
     );
+    return { txHash, finality };
   }
   console.log(`[Relayer] Finalized: ${txHash}`);
 
@@ -154,4 +184,4 @@ export async function readContract(address, functionName, args = []) {
   return raw;
 }
 
-export { rpc, getClient };
+export { rpc, getClient, FINALITY_BUDGET_MS };

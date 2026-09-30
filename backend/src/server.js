@@ -6,7 +6,15 @@
  * transaction abstraction, and the complete mandate lifecycle.
  */
 
+import dns from "dns";
+import { Agent, setGlobalDispatcher } from "undici";
 import dotenv from "dotenv";
+
+// Serverless runtimes often resolve AAAA records that have no route out, which
+// makes Neon and the GenLayer RPC hang instead of failing fast. Pin to IPv4.
+dns.setDefaultResultOrder("ipv4first");
+setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
+
 dotenv.config();
 
 import express from "express";
@@ -23,9 +31,25 @@ const { Pool } = pg;
 
 const app = express();
 app.use(express.json());
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+    origin(origin, cb) {
+      // Non-browser callers (curl, health checks) send no Origin header.
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) {
+        return cb(null, true);
+      }
+      // Any preview deployment of the frontend project.
+      if (/^https:\/\/reinprotocol-[a-z0-9-]+\.vercel\.app$/.test(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error(`Origin ${origin} not allowed by CORS`));
+    },
     credentials: true,
   })
 );
@@ -43,6 +67,31 @@ const privy = new PrivyClient(
 );
 
 // Contract addresses from deployment
+// Budget for writes that only need broadcasting. Zero means return as soon as
+// there is a transaction hash; the outcome is confirmed later by reading
+// contract state, which keeps every request inside a serverless function
+// ceiling even though consensus on an LLM call takes 50-90 seconds.
+const SUBMIT_BUDGET_MS = Number(process.env.GENLAYER_SUBMIT_BUDGET_MS || 0);
+// Ceiling for waiting on a deterministic write to appear in contract state.
+const READBACK_BUDGET_MS = Number(process.env.GENLAYER_READBACK_BUDGET_MS || 40000);
+
+// Waits for a deterministic write to become visible in contract state. The
+// transaction status cannot be used for this: GenLayer has been observed
+// reporting CANCELED for transactions whose writes did land, so the only
+// dependable signal is reading the value back. Bounded so a stuck write
+// surfaces as a slow response rather than a serverless timeout.
+async function waitForState(read, predicate, budgetMs = READBACK_BUDGET_MS) {
+  const deadline = Date.now() + budgetMs;
+  let last = null;
+  for (;;) {
+    last = await read().catch(() => null);
+    const hit = predicate(last);
+    if (hit) return hit;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
 const CONTRACTS = {
   mandateRegistry: process.env.MANDATE_REGISTRY_ADDRESS,
   reinCourt: process.env.REIN_COURT_ADDRESS,
@@ -149,19 +198,33 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
         spend_ceiling_wei || "0",
         chain_id || "1",
         session_key_id || "",
-      ]
+      ],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
 
-    // Read back the mandate to get the delegation_id
-    const allMandates = await readContract(
-      CONTRACTS.mandateRegistry,
-      "get_all_mandates",
-      []
+    // Read back the mandate to get the delegation_id the contract assigned.
+    const latestMandate = await waitForState(
+      () => readContract(CONTRACTS.mandateRegistry, "get_all_mandates", []),
+      (all) =>
+        Array.isArray(all)
+          ? all
+              .filter(
+                (m) =>
+                  m?.agent_address?.toLowerCase() ===
+                    agent_address.toLowerCase() &&
+                  m?.mandate_text === mandate_text
+              )
+              .pop()
+          : null
     );
 
-    const latestMandate = Array.isArray(allMandates)
-      ? allMandates[allMandates.length - 1]
-      : null;
+    if (!latestMandate) {
+      return res.status(504).json({
+        error:
+          "Mandate was broadcast but has not reached consensus yet. It will appear once the network settles.",
+        genlayer_tx_hash: txHash,
+      });
+    }
 
     const delegationId = latestMandate?.delegation_id || `del_${Date.now()}`;
 
@@ -230,6 +293,10 @@ app.get("/api/mandates/:delegationId", requireAuth, async (req, res) => {
 
 // ─── Action Review Routes ────────────────────────────────────────────────────
 
+// Reviewing an action runs an LLM through GenLayer consensus, which measured
+// 52-89s end to end. That exceeds the function ceiling on most serverless
+// hosts, so the request only broadcasts the transaction and returns. The
+// client then polls the status route until the verdict lands on chain.
 app.post("/api/actions/review", requireAuth, async (req, res) => {
   try {
     const { delegation_id, tx_hash, chain_id, action_description } = req.body;
@@ -240,7 +307,6 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
         .json({ error: "delegation_id and tx_hash are required" });
     }
 
-    // Get the mandate text
     const mandateResult = await pool.query(
       "SELECT * FROM mandates WHERE delegation_id = $1",
       [delegation_id]
@@ -250,7 +316,6 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
     }
     const mandate = mandateResult.rows[0];
 
-    // Create action record
     const actionId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     await pool.query(
       `INSERT INTO actions (action_id, delegation_id, tx_hash, chain_id, action_description, submitted_by, status)
@@ -265,7 +330,6 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
       ]
     );
 
-    // Submit to ReinCourt for review
     const { txHash: glTxHash } = await writeContract(
       CONTRACTS.reinCourt,
       "review_action",
@@ -275,117 +339,204 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
         chain_id || mandate.chain_id || "1",
         action_description || "",
         mandate.mandate_text,
-      ]
+      ],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
-
-    // Read the verdict from the contract
-    const recentVerdicts = await readContract(
-      CONTRACTS.reinCourt,
-      "get_verdicts_by_delegation",
-      [delegation_id]
-    );
-
-    const latestVerdict = Array.isArray(recentVerdicts)
-      ? recentVerdicts[recentVerdicts.length - 1]
-      : null;
-
-    // Store verdict in DB
-    const verdictId =
-      latestVerdict?.verdict_id ||
-      `vrd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     await pool.query(
-      `INSERT INTO verdicts (
-        verdict_id, delegation_id, action_id, tx_hash, verdict, severity,
-        breached_clause, reasoning, confidence, genlayer_tx_hash, genlayer_contract_address
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-      ON CONFLICT (verdict_id) DO NOTHING`,
-      [
-        verdictId,
-        delegation_id,
-        actionId,
-        tx_hash,
-        latestVerdict?.verdict || "ambiguous",
-        latestVerdict?.severity || "LOW",
-        latestVerdict?.breached_clause || null,
-        latestVerdict?.reasoning || "",
-        latestVerdict?.confidence || 0,
-        glTxHash,
-        CONTRACTS.reinCourt,
-      ]
-    );
-
-    // Update action status
-    await pool.query(
-      "UPDATE actions SET status = 'REVIEWED', genlayer_tx_hash = $1 WHERE action_id = $2",
+      "UPDATE actions SET genlayer_tx_hash = $1 WHERE action_id = $2",
       [glTxHash, actionId]
     );
 
-    // If breach with severity >= MED, auto-trigger revocation
-    const verdict = latestVerdict?.verdict;
-    const severity = latestVerdict?.severity;
-    let revocation = null;
-
-    if (
-      verdict === "breach" &&
-      ["MED", "HIGH", "CRITICAL"].includes(severity)
-    ) {
-      try {
-        const { txHash: revTxHash } = await writeContract(
-          CONTRACTS.enforcer,
-          "execute_revocation",
-          [delegation_id, verdictId, JSON.stringify(latestVerdict)]
-        );
-
-        // Read revocation record
-        const allRevocations = await readContract(
-          CONTRACTS.enforcer,
-          "get_revocations_by_delegation",
-          [delegation_id]
-        );
-
-        const latestRev = Array.isArray(allRevocations)
-          ? allRevocations[allRevocations.length - 1]
-          : null;
-
-        const revId =
-          latestRev?.revocation_id ||
-          `rev_${Date.now()}`;
-
-        await pool.query(
-          `INSERT INTO revocations (revocation_id, delegation_id, verdict_id, severity, reason, status, genlayer_tx_hash)
-           VALUES ($1, $2, $3, $4, $5, 'EXECUTED', $6)
-           ON CONFLICT (revocation_id) DO NOTHING`,
-          [revId, delegation_id, verdictId, severity, latestVerdict?.reasoning || "", revTxHash]
-        );
-
-        // Update mandate status
-        await pool.query(
-          "UPDATE mandates SET status = 'REVOKED', updated_at = NOW() WHERE delegation_id = $1",
-          [delegation_id]
-        );
-
-        revocation = latestRev;
-      } catch (revErr) {
-        console.error("[Enforcer] Auto-revocation failed:", revErr.message);
-      }
-    } else if (verdict === "breach") {
-      // Low severity breach: flag but don't revoke
-      await pool.query(
-        "UPDATE mandates SET status = 'FLAGGED', updated_at = NOW() WHERE delegation_id = $1",
-        [delegation_id]
-      );
-    }
-
     res.json({
       action_id: actionId,
-      verdict: latestVerdict,
-      revocation,
+      status: "REVIEWING",
+      verdict: null,
+      revocation: null,
       genlayer_tx_hash: glTxHash,
     });
   } catch (err) {
     console.error("[Review] Error:", err.message);
     res.status(500).json({ error: `Review failed: ${err.message}` });
+  }
+});
+
+// Poll target for a review submitted above. The contract's own state is the
+// source of truth here, not the transaction status: GenLayer has been observed
+// reporting CANCELED for a transaction whose writes did land, so a status check
+// alone would discard a perfectly good verdict.
+app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
+  try {
+    const { actionId } = req.params;
+    const actionResult = await pool.query(
+      "SELECT * FROM actions WHERE action_id = $1",
+      [actionId]
+    );
+    if (actionResult.rows.length === 0) {
+      return res.status(404).json({ error: "Action not found" });
+    }
+    const action = actionResult.rows[0];
+
+    const stored = await pool.query(
+      "SELECT * FROM verdicts WHERE action_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [actionId]
+    );
+
+    let verdictRow = stored.rows[0] || null;
+
+    if (!verdictRow) {
+      const onChain = await readContract(
+        CONTRACTS.reinCourt,
+        "get_verdicts_by_delegation",
+        [action.delegation_id]
+      ).catch(() => []);
+
+      const match = Array.isArray(onChain)
+        ? onChain.filter((v) => v?.tx_hash === action.tx_hash).pop()
+        : null;
+
+      if (!match) {
+        return res.json({
+          action_id: actionId,
+          status: "REVIEWING",
+          verdict: null,
+          revocation: null,
+          genlayer_tx_hash: action.genlayer_tx_hash,
+        });
+      }
+
+      const verdictId =
+        match.verdict_id || `vrd_${actionId}`;
+
+      await pool.query(
+        `INSERT INTO verdicts (
+          verdict_id, delegation_id, action_id, tx_hash, verdict, severity,
+          breached_clause, reasoning, confidence, genlayer_tx_hash, genlayer_contract_address
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (verdict_id) DO NOTHING`,
+        [
+          verdictId,
+          action.delegation_id,
+          actionId,
+          action.tx_hash,
+          match.verdict || "ambiguous",
+          match.severity || "LOW",
+          match.breached_clause || null,
+          match.reasoning || "",
+          match.confidence || 0,
+          action.genlayer_tx_hash,
+          CONTRACTS.reinCourt,
+        ]
+      );
+
+      await pool.query(
+        "UPDATE actions SET status = 'REVIEWED' WHERE action_id = $1",
+        [actionId]
+      );
+
+      const reread = await pool.query(
+        "SELECT * FROM verdicts WHERE verdict_id = $1",
+        [verdictId]
+      );
+      verdictRow = reread.rows[0] || null;
+    }
+
+    // Enforcement is driven off the verdict, and is itself a consensus write,
+    // so it is fired once and confirmed on a later poll rather than awaited.
+    let revocation = null;
+    if (verdictRow) {
+      const revResult = await pool.query(
+        "SELECT * FROM revocations WHERE verdict_id = $1 LIMIT 1",
+        [verdictRow.verdict_id]
+      );
+      revocation = revResult.rows[0] || null;
+
+      const enforceable =
+        verdictRow.verdict === "breach" &&
+        ["MED", "HIGH", "CRITICAL"].includes(verdictRow.severity);
+
+      if (enforceable && !revocation) {
+        try {
+          const { txHash: revTxHash } = await writeContract(
+            CONTRACTS.enforcer,
+            "execute_revocation",
+            [
+              action.delegation_id,
+              verdictRow.verdict_id,
+              JSON.stringify({
+                verdict: verdictRow.verdict,
+                severity: verdictRow.severity,
+                reasoning: verdictRow.reasoning,
+                breached_clause: verdictRow.breached_clause,
+              }),
+            ],
+            { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
+          );
+
+          const revId = `rev_${verdictRow.verdict_id}`;
+          await pool.query(
+            `INSERT INTO revocations (revocation_id, delegation_id, verdict_id, severity, reason, status, genlayer_tx_hash)
+             VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
+             ON CONFLICT (revocation_id) DO NOTHING`,
+            [
+              revId,
+              action.delegation_id,
+              verdictRow.verdict_id,
+              verdictRow.severity,
+              verdictRow.reasoning || "",
+              revTxHash,
+            ]
+          );
+
+          await pool.query(
+            "UPDATE mandates SET status = 'REVOKED', updated_at = NOW() WHERE delegation_id = $1",
+            [action.delegation_id]
+          );
+
+          const revRead = await pool.query(
+            "SELECT * FROM revocations WHERE revocation_id = $1",
+            [revId]
+          );
+          revocation = revRead.rows[0] || null;
+        } catch (revErr) {
+          console.error("[Enforcer] Auto-revocation failed:", revErr.message);
+        }
+      } else if (revocation && revocation.status === "PENDING") {
+        const onChainRevs = await readContract(
+          CONTRACTS.enforcer,
+          "get_revocations_by_delegation",
+          [action.delegation_id]
+        ).catch(() => []);
+        const confirmed = Array.isArray(onChainRevs)
+          ? onChainRevs.some((r) => r?.verdict_id === verdictRow.verdict_id)
+          : false;
+        if (confirmed) {
+          await pool.query(
+            "UPDATE revocations SET status = 'EXECUTED' WHERE revocation_id = $1",
+            [revocation.revocation_id]
+          );
+          revocation = { ...revocation, status: "EXECUTED" };
+        }
+      }
+
+      if (verdictRow.verdict === "breach" && !enforceable) {
+        await pool.query(
+          "UPDATE mandates SET status = 'FLAGGED', updated_at = NOW() WHERE delegation_id = $1",
+          [action.delegation_id]
+        );
+      }
+    }
+
+    res.json({
+      action_id: actionId,
+      status: verdictRow ? "REVIEWED" : "REVIEWING",
+      verdict: verdictRow,
+      revocation,
+      genlayer_tx_hash: action.genlayer_tx_hash,
+    });
+  } catch (err) {
+    console.error("[ReviewStatus] Error:", err.message);
+    res.status(500).json({ error: `Status check failed: ${err.message}` });
   }
 });
 
@@ -454,18 +605,26 @@ app.post("/api/appeals", requireAuth, async (req, res) => {
     const { txHash } = await writeContract(
       CONTRACTS.enforcer,
       "file_appeal",
-      [revocation_id, appeal_reason, bond_amount || "0"]
+      [revocation_id, appeal_reason, bond_amount || "0"],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
 
-    // Read appeal record
-    const allAppeals = await readContract(
-      CONTRACTS.enforcer,
-      "get_all_appeals",
-      []
+    // Read the appeal record back out of contract state.
+    const latestAppeal = await waitForState(
+      () => readContract(CONTRACTS.enforcer, "get_all_appeals", []),
+      (all) =>
+        Array.isArray(all)
+          ? all.filter((a) => a?.revocation_id === revocation_id).pop()
+          : null
     );
-    const latestAppeal = Array.isArray(allAppeals)
-      ? allAppeals[allAppeals.length - 1]
-      : null;
+
+    if (!latestAppeal) {
+      return res.status(504).json({
+        error:
+          "Appeal was broadcast but has not reached consensus yet. It will appear once the network settles.",
+        genlayer_tx_hash: txHash,
+      });
+    }
 
     const appealId =
       latestAppeal?.appeal_id ||
@@ -495,11 +654,12 @@ app.post("/api/appeals", requireAuth, async (req, res) => {
   }
 });
 
+// Adjudication is the second LLM path through consensus, so like review it
+// only broadcasts here and is confirmed by the status route below.
 app.post("/api/appeals/:appealId/adjudicate", requireAuth, async (req, res) => {
   try {
     const { appealId } = req.params;
 
-    // Get the appeal and related data
     const appealResult = await pool.query(
       `SELECT a.*, r.delegation_id, r.verdict_id
        FROM appeals a
@@ -514,47 +674,89 @@ app.post("/api/appeals/:appealId/adjudicate", requireAuth, async (req, res) => {
 
     const appeal = appealResult.rows[0];
 
-    // Get mandate text for re-adjudication
     const mandateResult = await pool.query(
       "SELECT mandate_text FROM mandates WHERE delegation_id = $1",
       [appeal.delegation_id]
     );
-
     const mandateText = mandateResult.rows[0]?.mandate_text || "";
 
-    // Get the original action description
     const verdictResult = await pool.query(
       "SELECT * FROM verdicts WHERE verdict_id = $1",
       [appeal.verdict_id]
     );
-
     const actionDesc = verdictResult.rows[0]?.reasoning || "";
 
-    // Submit to Enforcer for adjudication
     const { txHash } = await writeContract(
       CONTRACTS.enforcer,
       "adjudicate_appeal",
-      [appealId, mandateText, actionDesc]
+      [appealId, mandateText, actionDesc],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
 
-    // Read result
-    const adjResult = await readContract(
-      CONTRACTS.enforcer,
-      "get_appeal",
+    await pool.query(
+      `UPDATE appeals SET status = 'ADJUDICATING', genlayer_tx_hash = $1 WHERE appeal_id = $2`,
+      [txHash, appealId]
+    );
+
+    res.json({
+      appeal_id: appealId,
+      status: "ADJUDICATING",
+      adjudication: null,
+      genlayer_tx_hash: txHash,
+    });
+  } catch (err) {
+    console.error("[Appeals] Adjudicate error:", err.message);
+    res.status(500).json({ error: `Adjudication failed: ${err.message}` });
+  }
+});
+
+app.get("/api/appeals/:appealId/status", requireAuth, async (req, res) => {
+  try {
+    const { appealId } = req.params;
+    const appealResult = await pool.query(
+      `SELECT a.*, r.delegation_id
+       FROM appeals a
+       JOIN revocations r ON a.revocation_id = r.revocation_id
+       WHERE a.appeal_id = $1`,
       [appealId]
     );
+    if (appealResult.rows.length === 0) {
+      return res.status(404).json({ error: "Appeal not found" });
+    }
+    const appeal = appealResult.rows[0];
 
-    const newStatus = adjResult?.status || "UPHELD";
+    if (appeal.status !== "ADJUDICATING") {
+      return res.json({
+        appeal_id: appealId,
+        status: appeal.status,
+        adjudication: appeal.adjudication_result || null,
+        genlayer_tx_hash: appeal.genlayer_tx_hash,
+      });
+    }
 
-    // Update DB
+    const adjResult = await readContract(CONTRACTS.enforcer, "get_appeal", [
+      appealId,
+    ]).catch(() => null);
+
+    const resolved =
+      adjResult?.status && ["UPHELD", "OVERTURNED"].includes(adjResult.status);
+
+    if (!resolved) {
+      return res.json({
+        appeal_id: appealId,
+        status: "ADJUDICATING",
+        adjudication: null,
+        genlayer_tx_hash: appeal.genlayer_tx_hash,
+      });
+    }
+
     await pool.query(
-      `UPDATE appeals SET status = $1, adjudication_result = $2, genlayer_tx_hash = $3, resolved_at = NOW()
-       WHERE appeal_id = $4`,
-      [newStatus, adjResult?.adjudication_result || "", txHash, appealId]
+      `UPDATE appeals SET status = $1, adjudication_result = $2, resolved_at = NOW()
+       WHERE appeal_id = $3`,
+      [adjResult.status, adjResult.adjudication_result || "", appealId]
     );
 
-    // If overturned, restore the mandate
-    if (newStatus === "OVERTURNED") {
+    if (adjResult.status === "OVERTURNED") {
       await pool.query(
         "UPDATE mandates SET status = 'RESTORED', updated_at = NOW() WHERE delegation_id = $1",
         [appeal.delegation_id]
@@ -563,13 +765,13 @@ app.post("/api/appeals/:appealId/adjudicate", requireAuth, async (req, res) => {
 
     res.json({
       appeal_id: appealId,
-      status: newStatus,
+      status: adjResult.status,
       adjudication: adjResult,
-      genlayer_tx_hash: txHash,
+      genlayer_tx_hash: appeal.genlayer_tx_hash,
     });
   } catch (err) {
-    console.error("[Appeals] Adjudicate error:", err.message);
-    res.status(500).json({ error: `Adjudication failed: ${err.message}` });
+    console.error("[Appeals] Status error:", err.message);
+    res.status(500).json({ error: `Status check failed: ${err.message}` });
   }
 });
 
@@ -659,8 +861,14 @@ app.get("/api/health", (req, res) => {
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`REIN backend running on port ${PORT}`);
-  console.log(`Contract addresses:`, CONTRACTS);
-});
+// Vercel (and any other serverless host) imports `app` and drives it directly.
+// Only bind a port when this file is the process entrypoint.
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`REIN backend running on port ${PORT}`);
+    console.log(`Contract addresses:`, CONTRACTS);
+  });
+}
+
+export default app;

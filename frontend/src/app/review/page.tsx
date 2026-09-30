@@ -18,6 +18,7 @@ function ReviewContent() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState('');
+  const [progress, setProgress] = useState('');
 
   const [formData, setFormData] = useState({
     delegationId: prefillMandateId || '',
@@ -57,12 +58,38 @@ function ReviewContent() {
         chain_id: formData.chainId,
         action_description: formData.description,
       });
-      setResult(res);
+
+      // The review runs an LLM through GenLayer consensus, which takes roughly
+      // a minute. The submit call only broadcasts, so poll until the verdict
+      // is on chain.
+      setProgress('Submitted to GenLayer. Waiting for validators to reach consensus...');
+      const deadline = Date.now() + 5 * 60 * 1000;
+      let settled = res;
+
+      while (settled.status !== 'REVIEWED' && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const elapsed = Math.round((Date.now() - (deadline - 5 * 60 * 1000)) / 1000);
+        setProgress(`Waiting for consensus... ${elapsed}s elapsed (typically 50-90s)`);
+        try {
+          settled = await api.getActionStatus(token, res.action_id);
+        } catch {
+          // A transient poll failure is not fatal; keep waiting.
+        }
+      }
+
+      if (settled.status !== 'REVIEWED') {
+        throw new Error(
+          'The verdict has not reached consensus yet. It will appear on the Verdicts page once the network settles.'
+        );
+      }
+
+      setResult(settled);
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Review failed. The GenLayer network might be busy.');
     } finally {
       setLoading(false);
+      setProgress('');
     }
   };
 
@@ -154,6 +181,10 @@ function ReviewContent() {
               </>
             )}
           </button>
+
+          {loading && progress && (
+            <p className="text-xs font-mono text-neutral-500 text-center">{progress}</p>
+          )}
         </form>
       </div>
 

@@ -4,6 +4,72 @@ from genlayer import *
 import json
 
 
+def _normalize_confidence(value) -> float:
+    """
+    Coerce a model-supplied confidence to a 0..1 fraction.
+
+    Models answer this field as 0.9, as 90, or as a word. Consumers multiply by
+    100 to render a percentage, so anything above 1 is read as a percentage and
+    anything unparseable is reported as no confidence rather than guessed at.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, str):
+        try:
+            value = float(value.strip().rstrip("%"))
+        except Exception:
+            return 0.0
+    if not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    if value > 1.0:
+        value = value / 100.0
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+def _parse_llm_json(raw: str) -> dict:
+    """
+    Parse a JSON object out of an LLM's answer.
+
+    `prompt_comparative` hands back the winning validator's text verbatim, and
+    models routinely wrap JSON in a markdown fence or add a sentence either side
+    of it even when asked not to. Treating that as a hard failure throws away a
+    verdict the validators already agreed on, so recover the object instead:
+    strip any fence, then fall back to the outermost brace pair.
+    """
+    if isinstance(raw, dict):
+        return raw
+
+    text = str(raw).strip()
+
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
+        fence = text.rfind("```")
+        if fence != -1:
+            text = text[:fence]
+        text = text.strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(text[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise ValueError("expected a JSON object")
+    return parsed
+
+
+
 class ReinCourt(gl.Contract):
     """
     ReinCourt: the semantic judge.
@@ -54,9 +120,12 @@ class ReinCourt(gl.Contract):
 
     SEVERITY_ORDER = {"LOW": 0, "MED": 1, "HIGH": 2, "CRITICAL": 3}
 
+    # Bytes of explorer response fed to the judge prompt.
+    MAX_EVIDENCE_BYTES = 4000
+
     def __init__(self, registry_addr: str):
         self.owner = gl.message.sender_address
-        self.registry_address = str(registry_addr).strip()
+        self.registry_address = Address(str(registry_addr).strip())
         self.total_verdicts = u256(0)
 
     @gl.public.write
@@ -105,11 +174,27 @@ class ReinCourt(gl.Contract):
             for url_base in urls:
                 try:
                     resp = gl.nondet.web.get(url_base + clean_tx)
-                    if resp and len(str(resp)) > 10:
-                        tx_data_raw = str(resp)[:4000]
-                        break
                 except Exception:
                     continue
+                if resp is None:
+                    continue
+
+                # web.get returns a Response (status/headers/body), not text.
+                # Slice the body as bytes before decoding: an explorer page can
+                # be megabytes, and stringifying the whole response to keep 4 KB
+                # of it is what exhausts the VM. Headers are dropped too — they
+                # are attacker-influenced and carry no evidence.
+                status = getattr(resp, "status", 0)
+                body = getattr(resp, "body", None)
+                if not body or int(status) < 200 or int(status) >= 300:
+                    continue
+
+                text = bytes(body[: self.MAX_EVIDENCE_BYTES]).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                if len(text) > 10:
+                    tx_data_raw = text
+                    break
 
             if not tx_data_raw:
                 tx_data_raw = "Transaction data unavailable from explorers"
@@ -142,7 +227,13 @@ Rules:
 Return ONLY valid JSON:
 {{"verdict": "compliant"|"breach"|"ambiguous", "severity": "LOW"|"MED"|"HIGH"|"CRITICAL", "breached_clause": "the exact clause text that was breached"|null, "reasoning": "your detailed reasoning", "confidence": 0.0 to 1.0}}"""
 
-            return gl.nondet.exec_prompt(prompt, response_format="json")
+            # response_format="json" hands back a dict, not a string. This function
+            # is declared -> str and its result is both calldata-encoded for the
+            # leader receipt and parsed as JSON, so serialize it here.
+            return json.dumps(
+                gl.nondet.exec_prompt(prompt, response_format="json"),
+                sort_keys=True,
+            )
 
         comparison_prompt = """Compare the validator outputs for mandate compliance adjudication.
 
@@ -166,7 +257,7 @@ When outputs agree, prefer the result with:
         verdict_json = gl.eq_principle.prompt_comparative(_judge, comparison_prompt)
 
         try:
-            v_data = json.loads(verdict_json)
+            v_data = _parse_llm_json(verdict_json)
         except Exception:
             raise gl.vm.UserError("[EXPECTED] Consensus returned invalid verdict JSON")
 
@@ -191,7 +282,7 @@ When outputs agree, prefer the result with:
             "severity": severity_val,
             "breached_clause": v_data.get("breached_clause"),
             "reasoning": v_data.get("reasoning", ""),
-            "confidence": v_data.get("confidence", 0.0),
+            "confidence": _normalize_confidence(v_data.get("confidence")),
         }
 
         self.verdicts[verdict_id] = json.dumps(verdict_record, sort_keys=True)

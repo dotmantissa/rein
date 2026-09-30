@@ -75,6 +75,21 @@ function AppealsContent() {
       const token = await getAccessToken();
       if (!token) return;
       await api.adjudicateAppeal(token, appealId);
+
+      // Adjudication is an LLM call settled by GenLayer consensus, so the
+      // submit above only broadcasts. Poll until the ruling is on chain.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 5000));
+        let status = 'ADJUDICATING';
+        try {
+          status = (await api.getAppealStatus(token, appealId)).status;
+        } catch {
+          // Transient poll failure; keep waiting.
+        }
+        if (status !== 'ADJUDICATING' || Date.now() >= deadline) break;
+      }
+
       await loadAppeals();
     } catch (err: any) {
       console.error(err);
