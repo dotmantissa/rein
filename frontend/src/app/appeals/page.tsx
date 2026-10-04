@@ -81,12 +81,15 @@ function AppealsContent() {
 
   // Appeals are filed against a confirmed revocation, so the bond is denominated
   // in the native token of the chain the Enforcer runs on.
+  // Written without BigInt literals or ** on purpose: this project's tsconfig
+  // sets no `target`, so TypeScript defaults to ES5 and `10n` fails to compile.
   const formatBond = (wei: string) => {
     try {
+      const ONE = BigInt('1000000000000000000');
       const n = BigInt(wei);
-      const whole = n / 10n ** 18n;
-      const frac = (n % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '');
-      return frac ? `${whole}.${frac}` : `${whole}`;
+      const whole = (n / ONE).toString();
+      const frac = (n % ONE).toString().padStart(18, '0').replace(/0+$/, '');
+      return frac ? `${whole}.${frac}` : whole;
     } catch {
       return wei;
     }
