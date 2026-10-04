@@ -25,7 +25,23 @@ import {
   writeContract,
   readContract,
   pollTxFinality,
+  getRelayerBalance,
+  relayerAddress,
+  txOutcome,
 } from "./genlayerRelayer.js";
+import {
+  delegationHandle,
+  findStateChangeTx,
+  hostChainConfigured,
+  hostChainInfo,
+  isActive as hostIsActive,
+  openDelegation as hostOpenDelegation,
+  restoreDelegation as hostRestoreDelegation,
+  revokeDelegation as hostRevokeDelegation,
+  txMined as hostTxMined,
+  hostChainId,
+  hostRegistryAddress,
+} from "./hostChain.js";
 
 const { Pool } = pg;
 
@@ -99,6 +115,25 @@ const CONTRACTS = {
   reinCourt: process.env.REIN_COURT_ADDRESS,
   enforcer: process.env.ENFORCER_ADDRESS,
 };
+
+// The appeal bond, in wei of GenLayer's native token. The Enforcer enforces its
+// own floor; this is what the app posts. Operators sign in with an email and
+// hold no GenLayer account, so the relayer escrows the bond as their custodian
+// and the contract returns it to whichever account paid.
+const APPEAL_BOND_WEI = BigInt(process.env.APPEAL_BOND_WEI || "10000000000000000");
+
+// What the agent is allowed to spend through the host-chain session key, over
+// and above the mandate's own ceiling. Zero escrow means the delegation is
+// registered and revocable but holds no funds, which is the right default for a
+// mandate whose allowance lives in the operator's own smart account.
+const HOST_ESCROW_WEI = BigInt(process.env.HOST_ESCROW_WEI || "0");
+
+// How many times a review may be resubmitted after GenLayer fails to reach a
+// majority on it. Consensus failure is a property of the network on the day,
+// not of the request, so a couple of retries is usually the difference between
+// a verdict and a dead review -- but it must be bounded, or a request that can
+// never succeed is retried forever.
+const MAX_REVIEW_ATTEMPTS = Number(process.env.MAX_REVIEW_ATTEMPTS || 3);
 
 // ─── Auth Middleware ─────────────────────────────────────────────────────────
 
@@ -188,8 +223,31 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
         .status(400)
         .json({ error: "delegator, agent_address, and mandate_text are required" });
     }
+    if (!session_key_id) {
+      return res.status(400).json({
+        error:
+          "session_key_id is required: it is the host-chain key REIN revokes, " +
+          "and a mandate without one cannot be enforced",
+      });
+    }
+    if (!hostRegistryAddress()) {
+      return res.status(503).json({
+        error:
+          "hostRegistryAddress() is not configured, so a revocation could " +
+          "not be enforced. Deploy the host contract first (npm run deploy:host).",
+      });
+    }
+    // The court can only fetch evidence for the chain the delegation runs on,
+    // and the guardian can only revoke on the chain the registry is deployed to.
+    const chain = String(chain_id || hostChainId());
+    if (chain !== String(hostChainId())) {
+      return res.status(400).json({
+        error: `This deployment enforces on chain ${hostChainId()}; a mandate on chain ${chain} could not be revoked`,
+      });
+    }
 
-    // Write to GenLayer contract
+    // Register on GenLayer first: the delegation_id it assigns is what both
+    // chains key the delegation by.
     const { txHash } = await writeContract(
       CONTRACTS.mandateRegistry,
       "register_mandate",
@@ -198,8 +256,9 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
         agent_address,
         mandate_text,
         spend_ceiling_wei || "0",
-        chain_id || "1",
-        session_key_id || "",
+        chain,
+        session_key_id,
+        hostRegistryAddress,
       ],
       { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
@@ -228,37 +287,69 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
       });
     }
 
-    const delegationId = latestMandate?.delegation_id || `del_${Date.now()}`;
+    const delegationId = latestMandate.delegation_id;
 
-    // Persist to database
+    // Open the matching delegation on the host chain. Until this exists there
+    // is no authority to revoke, so the mandate is stored as PENDING_HOST and
+    // the UI can say so rather than implying it is enforceable.
+    let hostOpen = null;
+    let hostError = null;
+    try {
+      hostOpen = await hostOpenDelegation({
+        delegationId,
+        agentAddress: agent_address,
+        sessionKey: session_key_id,
+        ceilingWei: spend_ceiling_wei || "0",
+        escrowWei: HOST_ESCROW_WEI.toString(),
+      });
+    } catch (err) {
+      hostError = err.message;
+      console.error("[Mandates] Host-chain open failed:", err.message);
+    }
+
     const result = await pool.query(
       `INSERT INTO mandates (
         delegation_id, delegator, agent_address, mandate_text, mandate_hash,
         spend_ceiling_wei, chain_id, session_key_id, status,
-        genlayer_tx_hash, genlayer_contract_address, user_email
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        genlayer_tx_hash, genlayer_contract_address, user_email,
+        host_registry, host_delegation_id, host_open_tx_hash, host_status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       ON CONFLICT (delegation_id) DO UPDATE SET
-        status = EXCLUDED.status, updated_at = NOW()
+        status = EXCLUDED.status,
+        host_open_tx_hash = EXCLUDED.host_open_tx_hash,
+        host_status = EXCLUDED.host_status,
+        updated_at = NOW()
       RETURNING *`,
       [
         delegationId,
         delegator,
         agent_address,
         mandate_text,
-        latestMandate?.mandate_hash || "",
+        latestMandate.mandate_hash || "",
         spend_ceiling_wei || "0",
-        chain_id || "1",
-        session_key_id || "",
+        chain,
+        session_key_id,
         "ACTIVE",
         txHash,
         CONTRACTS.mandateRegistry,
         req.user?.email || "",
+        hostRegistryAddress,
+        latestMandate.host_delegation_id || delegationHandle(delegationId),
+        hostOpen?.hash || null,
+        hostOpen?.mined && hostOpen.status === 1 ? "OPEN" : "PENDING",
       ]
     );
 
     res.json({
       mandate: result.rows[0],
       genlayer_tx_hash: txHash,
+      host_chain: {
+        ...hostChainInfo(),
+        delegation_handle:
+          latestMandate.host_delegation_id || delegationHandle(delegationId),
+        open_tx_hash: hostOpen?.hash || null,
+        error: hostError,
+      },
     });
   } catch (err) {
     console.error("[Mandates] Create error:", err.message);
@@ -301,7 +392,7 @@ app.get("/api/mandates/:delegationId", requireAuth, async (req, res) => {
 // client then polls the status route until the verdict lands on chain.
 app.post("/api/actions/review", requireAuth, async (req, res) => {
   try {
-    const { delegation_id, tx_hash, chain_id, action_description } = req.body;
+    const { delegation_id, tx_hash, action_description } = req.body;
 
     if (!delegation_id || !tx_hash) {
       return res
@@ -326,22 +417,21 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
         actionId,
         delegation_id,
         tx_hash,
-        chain_id || mandate.chain_id || "1",
+        mandate.chain_id,
         action_description || "",
         req.user?.email || "",
       ]
     );
 
+    // The court takes a delegation and a transaction hash. It reads the
+    // mandate, the agent and the chain from MandateRegistry itself, so nothing
+    // this service believes about the delegation can influence the verdict.
+    // Passing mandate.mandate_text here, as this route used to, meant the
+    // judgement was made against whatever was in our own database.
     const { txHash: glTxHash } = await writeContract(
       CONTRACTS.reinCourt,
       "review_action",
-      [
-        delegation_id,
-        tx_hash,
-        chain_id || mandate.chain_id || "1",
-        action_description || "",
-        mandate.mandate_text,
-      ],
+      [delegation_id, tx_hash, action_description || ""],
       { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
 
@@ -362,6 +452,132 @@ app.post("/api/actions/review", requireAuth, async (req, res) => {
     res.status(500).json({ error: `Review failed: ${err.message}` });
   }
 });
+
+/**
+ * Drive one revocation forward by at most one step.
+ *
+ * Enforcement is four moves and two chains: rule on GenLayer, submit the
+ * revocation on the host chain, wait for it to mine, then have the Enforcer
+ * read the receipt back. Each is slow enough that doing them in one request
+ * would exceed a serverless function's ceiling, so a poll advances the state
+ * machine by a single step and returns. The authoritative state is always the
+ * Enforcer's own record, never this table.
+ *
+ * host_state runs: PENDING_VERDICT -> PENDING_HOST -> HOST_SUBMITTED ->
+ * CONFIRMING -> REVOKED.
+ */
+async function advanceRevocation(row) {
+  const { revocation_id, delegation_id, verdict_id, host_state } = row;
+
+  if (host_state === "REVOKED") return row;
+
+  // Step 2: the ruling is recorded on GenLayer. Find it and submit the real
+  // host-chain revocation.
+  if (host_state === "PENDING_HOST") {
+    const onChain = await readContract(CONTRACTS.enforcer, "get_revocation_by_verdict", [
+      verdict_id,
+    ]).catch(() => null);
+    if (!onChain?.revocation_id) return row;
+
+    await pool.query(
+      `UPDATE revocations SET revocation_id = $1, status = 'PENDING_HOST_REVOCATION'
+       WHERE revocation_id = $2`,
+      [onChain.revocation_id, revocation_id]
+    );
+
+    if (!hostChainConfigured()) {
+      console.warn("[Enforcer] Host chain not configured; cannot enforce revocation");
+      return { ...row, revocation_id: onChain.revocation_id };
+    }
+
+    let submitted = null;
+    try {
+      submitted = await hostRevokeDelegation({ delegationId: delegation_id, verdictId: verdict_id });
+    } catch (err) {
+      // A revoke that reverts because the delegation is already revoked means a
+      // previous attempt landed and the hash was lost between sending it and
+      // writing it down. Recover the hash from the event rather than giving up:
+      // the Enforcer confirms against a transaction hash, so without one a
+      // revocation that really happened could never be recorded.
+      console.error("[Enforcer] Host revoke failed:", err.message);
+      const recovered = await findStateChangeTx(delegation_id, "DelegationRevoked").catch(
+        () => null
+      );
+      if (!recovered) {
+        return { ...row, revocation_id: onChain.revocation_id };
+      }
+      console.log(`[Enforcer] Recovered revocation tx ${recovered.hash} from its event`);
+      submitted = { hash: recovered.hash };
+    }
+
+    await pool.query(
+      `UPDATE revocations SET host_state = 'HOST_SUBMITTED', evm_tx_hash = $1
+       WHERE revocation_id = $2`,
+      [submitted.hash, onChain.revocation_id]
+    );
+    return {
+      ...row,
+      revocation_id: onChain.revocation_id,
+      host_state: "HOST_SUBMITTED",
+      evm_tx_hash: submitted.hash,
+    };
+  }
+
+  // Step 3: once the host-chain transaction is mined, ask the Enforcer to
+  // verify it. It re-derives the event topic, the delegation handle and the
+  // expected state itself, so this is a request to check, not an assertion.
+  if (host_state === "HOST_SUBMITTED") {
+    const mined = await hostTxMined(row.evm_tx_hash);
+    if (!mined.mined) return row;
+    if (!mined.success) {
+      // A failed revoke is not a revocation. Clear the hash so the next poll
+      // submits a fresh one rather than confirming a transaction that reverted.
+      await pool.query(
+        `UPDATE revocations SET host_state = 'PENDING_HOST', evm_tx_hash = NULL
+         WHERE revocation_id = $1`,
+        [revocation_id]
+      );
+      return { ...row, host_state: "PENDING_HOST", evm_tx_hash: null };
+    }
+
+    const { txHash } = await writeContract(
+      CONTRACTS.enforcer,
+      "confirm_host_revocation",
+      [revocation_id, row.evm_tx_hash],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
+    );
+    await pool.query(
+      `UPDATE revocations SET host_state = 'CONFIRMING', confirm_tx_hash = $1
+       WHERE revocation_id = $2`,
+      [txHash, revocation_id]
+    );
+    return { ...row, host_state: "CONFIRMING", confirm_tx_hash: txHash };
+  }
+
+  // Step 4: the Enforcer's own record is what decides. Only when it says
+  // REVOKED is the authority actually gone.
+  if (host_state === "CONFIRMING") {
+    const onChain = await readContract(CONTRACTS.enforcer, "get_revocation", [
+      revocation_id,
+    ]).catch(() => null);
+    if (onChain?.status !== "REVOKED") return row;
+
+    await pool.query(
+      `UPDATE revocations SET host_state = 'REVOKED', status = 'REVOKED',
+         evm_tx_hash = $1, evm_block_number = $2
+       WHERE revocation_id = $3`,
+      [onChain.evm_tx_hash || row.evm_tx_hash, onChain.evm_block_number || null, revocation_id]
+    );
+    await pool.query(
+      `UPDATE mandates SET status = 'REVOKED', host_status = 'REVOKED', updated_at = NOW()
+       WHERE delegation_id = $1`,
+      [delegation_id]
+    );
+    return { ...row, host_state: "REVOKED", status: "REVOKED" };
+  }
+
+  return row;
+}
 
 // Poll target for a review submitted above. The contract's own state is the
 // source of truth here, not the transaction status: GenLayer has been observed
@@ -389,15 +605,60 @@ app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
     if (!verdictRow) {
       const onChain = await readContract(
         CONTRACTS.reinCourt,
-        "get_verdicts_by_delegation",
-        [action.delegation_id]
-      ).catch(() => []);
+        "get_verdict_for_action",
+        [action.delegation_id, action.tx_hash]
+      ).catch(() => null);
 
-      const match = Array.isArray(onChain)
-        ? onChain.filter((v) => v?.tx_hash === action.tx_hash).pop()
-        : null;
-
-      if (!match) {
+      if (!onChain?.verdict_id) {
+        // A review whose transaction failed consensus will never produce a
+        // verdict, and from contract state alone that is indistinguishable
+        // from one still being judged. Check the transaction and resubmit,
+        // bounded, rather than let the client poll forever.
+        const outcome = await txOutcome(action.genlayer_tx_hash);
+        if (outcome.failed && (action.review_attempts || 1) < MAX_REVIEW_ATTEMPTS) {
+          console.warn(
+            `[Review] ${action.genlayer_tx_hash} failed consensus (${outcome.reason}); resubmitting`
+          );
+          const { txHash: retryHash } = await writeContract(
+            CONTRACTS.reinCourt,
+            "review_action",
+            [action.delegation_id, action.tx_hash, action.action_description || ""],
+            { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
+          );
+          await pool.query(
+            `UPDATE actions SET genlayer_tx_hash = $1,
+               review_attempts = COALESCE(review_attempts, 1) + 1
+             WHERE action_id = $2`,
+            [retryHash, actionId]
+          );
+          return res.json({
+            action_id: actionId,
+            status: "REVIEWING",
+            verdict: null,
+            revocation: null,
+            consensus_retry: {
+              previous_tx: action.genlayer_tx_hash,
+              reason: outcome.reason,
+              attempt: (action.review_attempts || 1) + 1,
+            },
+            genlayer_tx_hash: retryHash,
+          });
+        }
+        if (outcome.failed) {
+          await pool.query(
+            "UPDATE actions SET status = 'CONSENSUS_FAILED' WHERE action_id = $1",
+            [actionId]
+          );
+          return res.status(503).json({
+            action_id: actionId,
+            status: "CONSENSUS_FAILED",
+            error:
+              `GenLayer could not reach a majority on this review after ` +
+              `${MAX_REVIEW_ATTEMPTS} attempts (${outcome.reason}). ` +
+              `Nothing was recorded and the delegation is unchanged.`,
+            genlayer_tx_hash: action.genlayer_tx_hash,
+          });
+        }
         return res.json({
           action_id: actionId,
           status: "REVIEWING",
@@ -407,27 +668,27 @@ app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
         });
       }
 
-      const verdictId =
-        match.verdict_id || `vrd_${actionId}`;
-
       await pool.query(
         `INSERT INTO verdicts (
           verdict_id, delegation_id, action_id, tx_hash, verdict, severity,
-          breached_clause, reasoning, confidence, genlayer_tx_hash, genlayer_contract_address
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          breached_clause, reasoning, confidence, genlayer_tx_hash,
+          genlayer_contract_address, attributed, facts
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (verdict_id) DO NOTHING`,
         [
-          verdictId,
+          onChain.verdict_id,
           action.delegation_id,
           actionId,
           action.tx_hash,
-          match.verdict || "ambiguous",
-          match.severity || "LOW",
-          match.breached_clause || null,
-          match.reasoning || "",
-          match.confidence || 0,
+          onChain.verdict || "ambiguous",
+          onChain.severity || "LOW",
+          onChain.breached_clause || null,
+          onChain.reasoning || "",
+          onChain.confidence || 0,
           action.genlayer_tx_hash,
           CONTRACTS.reinCourt,
+          Boolean(onChain.attributed),
+          onChain.facts || "",
         ]
       );
 
@@ -438,13 +699,11 @@ app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
 
       const reread = await pool.query(
         "SELECT * FROM verdicts WHERE verdict_id = $1",
-        [verdictId]
+        [onChain.verdict_id]
       );
       verdictRow = reread.rows[0] || null;
     }
 
-    // Enforcement is driven off the verdict, and is itself a consensus write,
-    // so it is fired once and confirmed on a later poll rather than awaited.
     let revocation = null;
     if (verdictRow) {
       const revResult = await pool.query(
@@ -453,35 +712,35 @@ app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
       );
       revocation = revResult.rows[0] || null;
 
+      // Only an attributed breach at MED or above is enforceable, and the
+      // Enforcer checks all three itself from the stored verdict.
       const enforceable =
         verdictRow.verdict === "breach" &&
+        verdictRow.attributed &&
         ["MED", "HIGH", "CRITICAL"].includes(verdictRow.severity);
 
       if (enforceable && !revocation) {
         try {
+          // The Enforcer is given the verdict id and reads the ruling out of the
+          // court. This route used to hand it a verdict JSON assembled from our
+          // own database, which meant anything that could write here could
+          // revoke an agent.
           const { txHash: revTxHash } = await writeContract(
             CONTRACTS.enforcer,
             "execute_revocation",
-            [
-              action.delegation_id,
-              verdictRow.verdict_id,
-              JSON.stringify({
-                verdict: verdictRow.verdict,
-                severity: verdictRow.severity,
-                reasoning: verdictRow.reasoning,
-                breached_clause: verdictRow.breached_clause,
-              }),
-            ],
+            [verdictRow.verdict_id],
             { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
           );
 
-          const revId = `rev_${verdictRow.verdict_id}`;
+          const placeholderId = `rev_pending_${verdictRow.verdict_id}`;
           await pool.query(
-            `INSERT INTO revocations (revocation_id, delegation_id, verdict_id, severity, reason, status, genlayer_tx_hash)
-             VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
-             ON CONFLICT (revocation_id) DO NOTHING`,
+            `INSERT INTO revocations (
+              revocation_id, delegation_id, verdict_id, severity, reason,
+              status, host_state, genlayer_tx_hash
+            ) VALUES ($1, $2, $3, $4, $5, 'PENDING_HOST_REVOCATION', 'PENDING_HOST', $6)
+            ON CONFLICT (revocation_id) DO NOTHING`,
             [
-              revId,
+              placeholderId,
               action.delegation_id,
               verdictRow.verdict_id,
               verdictRow.severity,
@@ -490,40 +749,35 @@ app.get("/api/actions/:actionId/status", requireAuth, async (req, res) => {
             ]
           );
 
+          // Flagged, not revoked. The authority is still live until the host
+          // chain says otherwise.
           await pool.query(
-            "UPDATE mandates SET status = 'REVOKED', updated_at = NOW() WHERE delegation_id = $1",
+            `UPDATE mandates SET status = 'FLAGGED', updated_at = NOW()
+             WHERE delegation_id = $1 AND status <> 'REVOKED'`,
             [action.delegation_id]
           );
 
           const revRead = await pool.query(
             "SELECT * FROM revocations WHERE revocation_id = $1",
-            [revId]
+            [placeholderId]
           );
           revocation = revRead.rows[0] || null;
         } catch (revErr) {
-          console.error("[Enforcer] Auto-revocation failed:", revErr.message);
+          console.error("[Enforcer] Revocation failed:", revErr.message);
         }
-      } else if (revocation && revocation.status === "PENDING") {
-        const onChainRevs = await readContract(
-          CONTRACTS.enforcer,
-          "get_revocations_by_delegation",
-          [action.delegation_id]
-        ).catch(() => []);
-        const confirmed = Array.isArray(onChainRevs)
-          ? onChainRevs.some((r) => r?.verdict_id === verdictRow.verdict_id)
-          : false;
-        if (confirmed) {
-          await pool.query(
-            "UPDATE revocations SET status = 'EXECUTED' WHERE revocation_id = $1",
-            [revocation.revocation_id]
-          );
-          revocation = { ...revocation, status: "EXECUTED" };
-        }
+      }
+
+      if (revocation && revocation.host_state !== "REVOKED") {
+        revocation = await advanceRevocation(revocation).catch((err) => {
+          console.error("[Enforcer] Advance failed:", err.message);
+          return revocation;
+        });
       }
 
       if (verdictRow.verdict === "breach" && !enforceable) {
         await pool.query(
-          "UPDATE mandates SET status = 'FLAGGED', updated_at = NOW() WHERE delegation_id = $1",
+          `UPDATE mandates SET status = 'FLAGGED', updated_at = NOW()
+           WHERE delegation_id = $1 AND status = 'ACTIVE'`,
           [action.delegation_id]
         );
       }
@@ -578,7 +832,7 @@ app.get("/api/verdicts", requireAuth, async (req, res) => {
 app.get("/api/revocations", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT r.*, m.mandate_text, m.agent_address
+      `SELECT r.*, m.mandate_text, m.agent_address, m.host_registry, m.chain_id
        FROM revocations r
        JOIN mandates m ON r.delegation_id = m.delegation_id
        WHERE m.user_email = $1
@@ -595,7 +849,7 @@ app.get("/api/revocations", requireAuth, async (req, res) => {
 
 app.post("/api/appeals", requireAuth, async (req, res) => {
   try {
-    const { revocation_id, appeal_reason, bond_amount } = req.body;
+    const { revocation_id, appeal_reason } = req.body;
 
     if (!revocation_id || !appeal_reason) {
       return res
@@ -603,15 +857,51 @@ app.post("/api/appeals", requireAuth, async (req, res) => {
         .json({ error: "revocation_id and appeal_reason are required" });
     }
 
-    // Submit appeal to Enforcer contract
+    const revResult = await pool.query(
+      "SELECT * FROM revocations WHERE revocation_id = $1",
+      [revocation_id]
+    );
+    if (revResult.rows.length === 0) {
+      return res.status(404).json({ error: "Revocation not found" });
+    }
+    const rev = revResult.rows[0];
+
+    // The Enforcer refuses an appeal against a revocation that has not actually
+    // taken effect, so say why rather than broadcasting a doomed transaction.
+    if (rev.host_state !== "REVOKED") {
+      return res.status(409).json({
+        error:
+          "This revocation has not been confirmed on the host chain yet, so " +
+          "there is nothing to appeal. It will become appealable once the " +
+          "revocation is recorded.",
+        host_state: rev.host_state,
+      });
+    }
+
+    // The bond is real native value, escrowed by the contract until the appeal
+    // is decided. Check we can actually pay it before promising one.
+    const balance = await getRelayerBalance().catch(() => 0n);
+    if (balance < APPEAL_BOND_WEI) {
+      return res.status(503).json({
+        error:
+          `The relayer cannot fund the ${APPEAL_BOND_WEI} wei appeal bond ` +
+          `(balance ${balance} wei). Top up ${relayerAddress()} to file appeals.`,
+      });
+    }
+
     const { txHash } = await writeContract(
       CONTRACTS.enforcer,
       "file_appeal",
-      [revocation_id, appeal_reason, bond_amount || "0"],
-      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
+      [revocation_id, appeal_reason],
+      {
+        requireFinality: false,
+        budgetMs: SUBMIT_BUDGET_MS,
+        value: APPEAL_BOND_WEI,
+      }
     );
 
-    // Read the appeal record back out of contract state.
+    // Read the appeal record back out of contract state. bond_wei is what the
+    // contract actually escrowed, which is the only number worth reporting.
     const latestAppeal = await waitForState(
       () => readContract(CONTRACTS.enforcer, "get_all_appeals", []),
       (all) =>
@@ -628,26 +918,29 @@ app.post("/api/appeals", requireAuth, async (req, res) => {
       });
     }
 
-    const appealId =
-      latestAppeal?.appeal_id ||
-      `apl_${Date.now()}`;
-
-    // Get the revocation to find the delegation
-    const revResult = await pool.query(
-      "SELECT * FROM revocations WHERE revocation_id = $1",
-      [revocation_id]
-    );
-
     await pool.query(
-      `INSERT INTO appeals (appeal_id, revocation_id, appeal_reason, bond_amount, status, genlayer_tx_hash, filed_by)
-       VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
-       ON CONFLICT (appeal_id) DO NOTHING`,
-      [appealId, revocation_id, appeal_reason, bond_amount || "0", txHash, req.user?.email || ""]
+      `INSERT INTO appeals (
+        appeal_id, revocation_id, appeal_reason, bond_amount, bond_wei,
+        appellant, watcher, status, genlayer_tx_hash, filed_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8, $9)
+      ON CONFLICT (appeal_id) DO NOTHING`,
+      [
+        latestAppeal.appeal_id,
+        revocation_id,
+        appeal_reason,
+        latestAppeal.bond_wei || "0",
+        latestAppeal.bond_wei || "0",
+        latestAppeal.appellant || relayerAddress(),
+        latestAppeal.watcher || "",
+        txHash,
+        req.user?.email || "",
+      ]
     );
 
     res.json({
-      appeal_id: appealId,
+      appeal_id: latestAppeal.appeal_id,
       appeal: latestAppeal,
+      bond_wei: latestAppeal.bond_wei,
       genlayer_tx_hash: txHash,
     });
   } catch (err) {
@@ -663,35 +956,22 @@ app.post("/api/appeals/:appealId/adjudicate", requireAuth, async (req, res) => {
     const { appealId } = req.params;
 
     const appealResult = await pool.query(
-      `SELECT a.*, r.delegation_id, r.verdict_id
-       FROM appeals a
-       JOIN revocations r ON a.revocation_id = r.revocation_id
-       WHERE a.appeal_id = $1`,
+      "SELECT * FROM appeals WHERE appeal_id = $1",
       [appealId]
     );
-
     if (appealResult.rows.length === 0) {
       return res.status(404).json({ error: "Appeal not found" });
     }
 
-    const appeal = appealResult.rows[0];
-
-    const mandateResult = await pool.query(
-      "SELECT mandate_text FROM mandates WHERE delegation_id = $1",
-      [appeal.delegation_id]
-    );
-    const mandateText = mandateResult.rows[0]?.mandate_text || "";
-
-    const verdictResult = await pool.query(
-      "SELECT * FROM verdicts WHERE verdict_id = $1",
-      [appeal.verdict_id]
-    );
-    const actionDesc = verdictResult.rows[0]?.reasoning || "";
-
+    // The Enforcer is given the appeal id and reads the registered mandate and
+    // the verified transaction facts itself. This route used to pass the
+    // mandate text from our database and, as the "action", the first judge's
+    // own reasoning -- so the appeal re-litigated a summary of the verdict
+    // instead of the thing the agent did.
     const { txHash } = await writeContract(
       CONTRACTS.enforcer,
       "adjudicate_appeal",
-      [appealId, mandateText, actionDesc],
+      [appealId],
       { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
 
@@ -712,6 +992,103 @@ app.post("/api/appeals/:appealId/adjudicate", requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * Carry an overturned appeal through to a restored delegation.
+ *
+ * The mirror of advanceRevocation, and needed for the same reason: "the
+ * delegation is restored to active status" is a fact about the host chain, so
+ * the restore has to be submitted there and read back before anything says the
+ * agent's key works again.
+ */
+async function advanceRestoration(appeal) {
+  const { appeal_id, revocation_id, restoration_state } = appeal;
+  if (restoration_state === "RESTORED") return appeal;
+
+  const revResult = await pool.query(
+    "SELECT delegation_id FROM revocations WHERE revocation_id = $1",
+    [revocation_id]
+  );
+  const delegationId = revResult.rows[0]?.delegation_id;
+  if (!delegationId) return appeal;
+
+  if (restoration_state === "PENDING_HOST_RESTORE") {
+    if (!hostChainConfigured()) return appeal;
+    let submitted = null;
+    try {
+      submitted = await hostRestoreDelegation({ delegationId, appealId: appeal_id });
+    } catch (err) {
+      // Same recovery as revocation: a restore that already landed cannot be
+      // sent again, and the Enforcer needs its hash to confirm it.
+      console.error("[Appeals] Host restore failed:", err.message);
+      const recovered = await findStateChangeTx(delegationId, "DelegationRestored").catch(
+        () => null
+      );
+      if (!recovered) return appeal;
+      console.log(`[Appeals] Recovered restoration tx ${recovered.hash} from its event`);
+      submitted = { hash: recovered.hash };
+    }
+    await pool.query(
+      `UPDATE appeals SET restoration_state = 'HOST_SUBMITTED', restoration_tx_hash = $1
+       WHERE appeal_id = $2`,
+      [submitted.hash, appeal_id]
+    );
+    return {
+      ...appeal,
+      restoration_state: "HOST_SUBMITTED",
+      restoration_tx_hash: submitted.hash,
+    };
+  }
+
+  if (restoration_state === "HOST_SUBMITTED") {
+    const mined = await hostTxMined(appeal.restoration_tx_hash);
+    if (!mined.mined) return appeal;
+    if (!mined.success) {
+      await pool.query(
+        `UPDATE appeals SET restoration_state = 'PENDING_HOST_RESTORE', restoration_tx_hash = NULL
+         WHERE appeal_id = $1`,
+        [appeal_id]
+      );
+      return { ...appeal, restoration_state: "PENDING_HOST_RESTORE", restoration_tx_hash: null };
+    }
+    const { txHash } = await writeContract(
+      CONTRACTS.enforcer,
+      "confirm_host_restoration",
+      [appeal_id, appeal.restoration_tx_hash],
+      { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
+    );
+    await pool.query(
+      `UPDATE appeals SET restoration_state = 'CONFIRMING', restoration_confirm_tx_hash = $1
+       WHERE appeal_id = $2`,
+      [txHash, appeal_id]
+    );
+    return { ...appeal, restoration_state: "CONFIRMING" };
+  }
+
+  if (restoration_state === "CONFIRMING") {
+    const onChain = await readContract(CONTRACTS.enforcer, "get_appeal", [
+      appeal_id,
+    ]).catch(() => null);
+    if (onChain?.restoration_status !== "RESTORED") return appeal;
+
+    await pool.query(
+      `UPDATE appeals SET restoration_state = 'RESTORED' WHERE appeal_id = $1`,
+      [appeal_id]
+    );
+    await pool.query(
+      `UPDATE revocations SET status = 'OVERTURNED' WHERE revocation_id = $1`,
+      [revocation_id]
+    );
+    await pool.query(
+      `UPDATE mandates SET status = 'RESTORED', host_status = 'OPEN', updated_at = NOW()
+       WHERE delegation_id = $1`,
+      [delegationId]
+    );
+    return { ...appeal, restoration_state: "RESTORED" };
+  }
+
+  return appeal;
+}
+
 app.get("/api/appeals/:appealId/status", requireAuth, async (req, res) => {
   try {
     const { appealId } = req.params;
@@ -725,50 +1102,74 @@ app.get("/api/appeals/:appealId/status", requireAuth, async (req, res) => {
     if (appealResult.rows.length === 0) {
       return res.status(404).json({ error: "Appeal not found" });
     }
-    const appeal = appealResult.rows[0];
+    let appeal = appealResult.rows[0];
 
-    if (appeal.status !== "ADJUDICATING") {
-      return res.json({
-        appeal_id: appealId,
-        status: appeal.status,
-        adjudication: appeal.adjudication_result || null,
-        genlayer_tx_hash: appeal.genlayer_tx_hash,
-      });
-    }
-
-    const adjResult = await readContract(CONTRACTS.enforcer, "get_appeal", [
+    const onChain = await readContract(CONTRACTS.enforcer, "get_appeal", [
       appealId,
     ]).catch(() => null);
 
     const resolved =
-      adjResult?.status && ["UPHELD", "OVERTURNED"].includes(adjResult.status);
+      onChain?.status && ["UPHELD", "OVERTURNED"].includes(onChain.status);
 
     if (!resolved) {
       return res.json({
         appeal_id: appealId,
-        status: "ADJUDICATING",
+        status: appeal.status === "ADJUDICATING" ? "ADJUDICATING" : appeal.status,
         adjudication: null,
         genlayer_tx_hash: appeal.genlayer_tx_hash,
       });
     }
 
-    await pool.query(
-      `UPDATE appeals SET status = $1, adjudication_result = $2, resolved_at = NOW()
-       WHERE appeal_id = $3`,
-      [adjResult.status, adjResult.adjudication_result || "", appealId]
-    );
-
-    if (adjResult.status === "OVERTURNED") {
+    if (appeal.status !== onChain.status) {
+      // The bond settlement is the contract's own record of where the money
+      // went, not a status this service decided.
       await pool.query(
-        "UPDATE mandates SET status = 'RESTORED', updated_at = NOW() WHERE delegation_id = $1",
-        [appeal.delegation_id]
+        `UPDATE appeals SET status = $1, adjudication_result = $2,
+           bond_settlement = $3, bond_paid_to = $4,
+           restoration_state = $5, resolved_at = NOW()
+         WHERE appeal_id = $6`,
+        [
+          onChain.status,
+          onChain.adjudication_result || "",
+          onChain.bond_settlement || "",
+          onChain.bond_paid_to || "",
+          onChain.status === "OVERTURNED" ? "PENDING_HOST_RESTORE" : "NONE",
+          appealId,
+        ]
       );
+      if (onChain.status === "UPHELD") {
+        await pool.query(
+          `UPDATE revocations SET status = 'UPHELD' WHERE revocation_id = $1`,
+          [appeal.revocation_id]
+        );
+      }
+      const reread = await pool.query(
+        `SELECT a.*, r.delegation_id FROM appeals a
+         JOIN revocations r ON a.revocation_id = r.revocation_id
+         WHERE a.appeal_id = $1`,
+        [appealId]
+      );
+      appeal = reread.rows[0] || appeal;
+    }
+
+    if (
+      onChain.status === "OVERTURNED" &&
+      appeal.restoration_state !== "RESTORED"
+    ) {
+      appeal = await advanceRestoration(appeal).catch((err) => {
+        console.error("[Appeals] Restoration advance failed:", err.message);
+        return appeal;
+      });
     }
 
     res.json({
       appeal_id: appealId,
-      status: adjResult.status,
-      adjudication: adjResult,
+      status: onChain.status,
+      adjudication: onChain,
+      restoration_state: appeal.restoration_state,
+      restoration_tx_hash: appeal.restoration_tx_hash,
+      bond_settlement: onChain.bond_settlement,
+      bond_paid_to: onChain.bond_paid_to,
       genlayer_tx_hash: appeal.genlayer_tx_hash,
     });
   } catch (err) {
@@ -857,8 +1258,56 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     contracts: CONTRACTS,
+    host_chain: hostChainInfo(),
+    appeal_bond_wei: APPEAL_BOND_WEI.toString(),
+    relayer: relayerAddress(),
     timestamp: new Date().toISOString(),
   });
+});
+
+/**
+ * What the host chain says about one delegation, read straight from
+ * ReinSessionKeyRegistry rather than from this table.
+ *
+ * This is the route that makes a revocation checkable by the operator: if
+ * active is false, the agent's session key cannot spend, whatever any database
+ * happens to say.
+ */
+app.get("/api/mandates/:delegationId/host", requireAuth, async (req, res) => {
+  try {
+    const { delegationId } = req.params;
+    const owned = await pool.query(
+      "SELECT delegation_id FROM mandates WHERE delegation_id = $1 AND user_email = $2",
+      [delegationId, req.user?.email || ""]
+    );
+    if (owned.rows.length === 0) {
+      return res.status(404).json({ error: "Mandate not found" });
+    }
+    if (!hostChainConfigured()) {
+      return res.status(503).json({ error: "Host chain is not configured" });
+    }
+
+    const handle = delegationHandle(delegationId);
+    const active = await hostIsActive(delegationId);
+    let delegation = null;
+    try {
+      const { getDelegation } = await import("./hostChain.js");
+      delegation = await getDelegation(delegationId);
+    } catch {
+      // Not opened on the host chain yet.
+    }
+
+    res.json({
+      delegation_id: delegationId,
+      handle,
+      active,
+      delegation,
+      ...hostChainInfo(),
+    });
+  } catch (err) {
+    console.error("[Host] Status error:", err.message);
+    res.status(500).json({ error: `Host chain query failed: ${err.message}` });
+  }
 });
 
 // ─── Start ───────────────────────────────────────────────────────────────────

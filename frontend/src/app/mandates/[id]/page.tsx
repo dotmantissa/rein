@@ -8,7 +8,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { ReinLine } from '@/components/timeline/ReinLine';
 import { TimelineEntry } from '@/components/timeline/TimelineEntry';
 import Link from 'next/link';
-import { Cpu, ShieldAlert, ArrowUpRight, Scale } from 'lucide-react';
+import { Cpu, ShieldAlert, ArrowUpRight, Scale, Link2, Lock, Unlock } from 'lucide-react';
 
 const CHAIN_NAMES: Record<string, string> = {
   '1': 'Ethereum',
@@ -41,6 +41,10 @@ export default function MandateDetailPage() {
   const [mandate, setMandate] = useState<any>(null);
   const [timeline, setTimeline] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  // Read straight from ReinSessionKeyRegistry on the host chain. This is the
+  // only statement on this page that is not a database row: if `active` is
+  // false, the agent's session key cannot spend, whatever anything else says.
+  const [host, setHost] = useState<any>(null);
 
   useEffect(() => {
     async function load() {
@@ -58,6 +62,10 @@ export default function MandateDetailPage() {
           if (verdictsRes?.verdicts) {
             setTimeline(verdictsRes.verdicts);
           }
+          api
+            .getHostStatus(token, id)
+            .then(setHost)
+            .catch(() => setHost(null));
         }
       } catch (e) {
         console.error(e);
@@ -117,6 +125,19 @@ export default function MandateDetailPage() {
                   Key: {mandate.session_key_id.slice(0, 10)}...
                 </span>
               )}
+              {host && (
+                <span
+                  className={`inline-flex items-center gap-1 border px-2 py-0.5 rounded-sm text-xs font-mono ${
+                    host.active
+                      ? 'border-green-500/30 bg-green-500/10 text-green-300'
+                      : 'border-[#eb1700]/40 bg-[#eb1700]/10 text-[#eb1700]'
+                  }`}
+                  title="Read live from the host-chain session key registry"
+                >
+                  {host.active ? <Unlock size={11} /> : <Lock size={11} />}
+                  {host.active ? 'key can spend' : 'key revoked on chain'}
+                </span>
+              )}
             </div>
           </div>
 
@@ -132,11 +153,61 @@ export default function MandateDetailPage() {
         </div>
 
         {mandate.genlayer_tx_hash && (
-          <div className="mt-4 pt-4 border-t border-[#2a2a2a] flex flex-wrap items-center justify-between text-xs text-neutral-500 font-mono">
+          <div className="mt-4 pt-4 border-t border-[#2a2a2a] flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-500 font-mono">
             <span>Delegation ID: {mandate.delegation_id}</span>
             <span className="text-neutral-400">
               GenLayer tx: {mandate.genlayer_tx_hash.slice(0, 10)}...{mandate.genlayer_tx_hash.slice(-8)}
             </span>
+          </div>
+        )}
+
+        {mandate.mandate_hash && (
+          <p className="mt-2 text-[11px] font-mono text-neutral-600 break-all">
+            Committed mandate hash: {mandate.mandate_hash}
+          </p>
+        )}
+
+        {host && (
+          <div className="mt-4 p-4 border border-[#2a2a2a] bg-black/20 rounded-sm space-y-2">
+            <div className="flex items-center gap-2 text-xs font-mono text-neutral-400">
+              <Link2 size={13} />
+              host chain authority
+            </div>
+            <p className="text-[11px] text-neutral-500 leading-relaxed">
+              The delegation this mandate governs lives on chain {host.chainId}.
+              Everything else on this page is a record of a decision; this is the
+              authority itself, read live from the registry.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-[11px] font-mono">
+              <div className="flex justify-between gap-2">
+                <span className="text-neutral-600">session key registry</span>
+                <span className="text-neutral-300 truncate">
+                  {host.sessionKeyRegistry
+                    ? `${host.sessionKeyRegistry.slice(0, 10)}...${host.sessionKeyRegistry.slice(-6)}`
+                    : 'not configured'}
+                </span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-neutral-600">can the key spend</span>
+                <span className={host.active ? 'text-green-300' : 'text-[#eb1700]'}>
+                  {host.active ? 'yes' : 'no'}
+                </span>
+              </div>
+              {host.delegation && (
+                <>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-neutral-600">spent of ceiling</span>
+                    <span className="text-neutral-300">
+                      {formatWei(host.delegation.spentWei)} / {formatWei(host.delegation.ceilingWei)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-neutral-600">registry state</span>
+                    <span className="text-neutral-300">{host.delegation.state}</span>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         )}
 
@@ -147,7 +218,13 @@ export default function MandateDetailPage() {
               Revocation Enforced
             </div>
             <p className="text-xs text-neutral-300 leading-relaxed">
-              This mandate has been revoked following an on-chain court review. Spending authority was terminated.
+              A breach verdict was reached on GenLayer and the revocation was
+              submitted to the host chain. The Enforcer read that transaction
+              back before recording this status, so the agent&rsquo;s session key
+              no longer spends.
+              {host && host.active
+                ? ' The host chain currently reports the key as live, which means a restoration has landed since.'
+                : ''}
             </p>
             <div className="mt-3">
               <Link

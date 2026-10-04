@@ -23,7 +23,6 @@ function ReviewContent() {
   const [formData, setFormData] = useState({
     delegationId: prefillMandateId || '',
     txHash: '',
-    chainId: '1',
     description: '',
   });
 
@@ -33,8 +32,12 @@ function ReviewContent() {
         const token = await getAccessToken();
         if (token) {
           const data = await api.getMandates(token);
-          const active = (data.mandates || []).filter((m: any) => m.status === 'ACTIVE');
-          setMandates(active);
+          // A revoked delegation has no authority left to judge, and the court
+          // refuses to review one. Everything still live can be reviewed.
+          const live = (data.mandates || []).filter((m: any) =>
+            ['ACTIVE', 'FLAGGED', 'RESTORED'].includes(m.status)
+          );
+          setMandates(live);
         }
       } catch (e) {
         console.error(e);
@@ -52,10 +55,13 @@ function ReviewContent() {
       const token = await getAccessToken();
       if (!token) throw new Error('Not authenticated');
 
+      // Only the delegation and the hash. The court reads the mandate, the
+      // agent and the chain out of MandateRegistry itself, so a review cannot be
+      // pointed at a different mandate or a different chain than the one that
+      // was registered.
       const res = await api.reviewAction(token, {
         delegation_id: formData.delegationId,
         tx_hash: formData.txHash,
-        chain_id: formData.chainId,
         action_description: formData.description,
       });
 
@@ -114,13 +120,17 @@ function ReviewContent() {
               <option value="" disabled className="bg-[#191919]">Pick the mandate this action should be judged against</option>
               {mandates.map(m => (
                 <option key={m.delegation_id} value={m.delegation_id} className="bg-[#191919]">
-                  {m.agent_address?.slice(0, 8)}... on {m.chain_id === '1' ? 'Ethereum' : m.chain_id === '8453' ? 'Base' : `chain ${m.chain_id}`}
+                  {m.agent_address?.slice(0, 10)}...{m.agent_address?.slice(-4)} &middot; {m.status}
                 </option>
               ))}
             </select>
             {mandates.length === 0 && (
-              <p className="text-xs text-neutral-600 mt-1">No active mandates. Write one first.</p>
+              <p className="text-xs text-neutral-600 mt-1">No live mandates. Write one first.</p>
             )}
+            <p className="text-[11px] text-neutral-600 mt-1.5">
+              The chain and the mandate text come from the registered delegation,
+              not from this form.
+            </p>
           </div>
 
           <div>
@@ -133,22 +143,6 @@ function ReviewContent() {
               className="w-full bg-transparent border border-[#2a2a2a] rounded-sm px-4 py-2.5 font-mono text-sm text-white placeholder:text-neutral-600 focus:outline-none focus:border-[#eb1700]/50 focus:ring-1 focus:ring-[#eb1700]/30 transition-colors"
               placeholder="0x..."
             />
-          </div>
-
-          <div>
-            <label className="block text-xs font-mono text-neutral-500 mb-1.5">chain id</label>
-            <select
-              required
-              value={formData.chainId}
-              onChange={(e) => setFormData({ ...formData, chainId: e.target.value })}
-              className="w-full bg-transparent border border-[#2a2a2a] rounded-sm px-4 py-2.5 text-sm font-mono text-white focus:outline-none focus:border-[#eb1700]/50 focus:ring-1 focus:ring-[#eb1700]/30 transition-colors"
-            >
-              <option value="1" className="bg-[#191919]">Ethereum (1)</option>
-              <option value="8453" className="bg-[#191919]">Base (8453)</option>
-              <option value="11155111" className="bg-[#191919]">Sepolia (11155111)</option>
-              <option value="137" className="bg-[#191919]">Polygon (137)</option>
-              <option value="42161" className="bg-[#191919]">Arbitrum (42161)</option>
-            </select>
           </div>
 
           <div>
@@ -205,6 +199,11 @@ function ReviewContent() {
             <div className="flex items-center gap-3 mb-4">
               <StatusBadge status={verdict.verdict} />
               {verdict.severity && <SeverityBadge severity={verdict.severity} />}
+              {verdict.attributed === false && (
+                <span className="text-xs text-neutral-500 font-mono">
+                  not the registered agent
+                </span>
+              )}
               {verdict.confidence && (
                 <span className="text-xs text-neutral-500 font-mono">
                   {(verdict.confidence * 100).toFixed(0)}% confident
@@ -228,10 +227,30 @@ function ReviewContent() {
               )}
 
               {result.revocation && (
-                <div className="mt-4 pt-4 border-t border-[#eb1700]/20">
-                  <p className="text-xs font-mono text-[#eb1700]">
-                    Revocation triggered. The delegation has been pulled.
-                  </p>
+                <div className="mt-4 pt-4 border-t border-[#eb1700]/20 space-y-1.5">
+                  {result.revocation.host_state === 'REVOKED' ? (
+                    <>
+                      <p className="text-xs font-mono text-[#eb1700]">
+                        Revoked. The agent&rsquo;s session key can no longer spend.
+                      </p>
+                      {result.revocation.evm_tx_hash && (
+                        <p className="text-[11px] font-mono text-neutral-500">
+                          host chain tx: {result.revocation.evm_tx_hash.slice(0, 12)}
+                          ...{result.revocation.evm_tx_hash.slice(-8)}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs font-mono text-amber-400">
+                        Flagged. The revocation is on its way to the host chain
+                        and the key is still live until it lands.
+                      </p>
+                      <p className="text-[11px] font-mono text-neutral-500">
+                        state: {result.revocation.host_state || 'PENDING_HOST'}
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
 

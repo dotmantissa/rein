@@ -8,7 +8,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "deploy": "node src/deploy.mjs",
-    "migrate": "node src/migrate.mjs"
+    "migrate": "node src/migrate.mjs",
+    "deploy:host": "node src/deployHost.mjs",
+    "compile:host": "node src/compileHost.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
@@ -20,5 +22,8 @@
     "genlayer-js": "^1.1.8",
     "pg": "^8.13.3",
     "undici": "^8.10.2"
+  },
+  "devDependencies": {
+    "solc": "^0.8.26"
   }
 }

@@ -31,6 +31,10 @@ async function migrate() {
       chain_id TEXT NOT NULL DEFAULT '1',
       session_key_id TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'ACTIVE',
+      host_registry TEXT,
+      host_delegation_id TEXT,
+      host_open_tx_hash TEXT,
+      host_status TEXT NOT NULL DEFAULT 'PENDING',
       genlayer_tx_hash TEXT,
       genlayer_contract_address TEXT,
       user_email TEXT,
@@ -51,6 +55,7 @@ async function migrate() {
       action_description TEXT NOT NULL DEFAULT '',
       submitted_by TEXT,
       genlayer_tx_hash TEXT,
+      review_attempts INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'PENDING',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -70,6 +75,8 @@ async function migrate() {
       breached_clause TEXT,
       reasoning TEXT,
       confidence REAL DEFAULT 0,
+      attributed BOOLEAN NOT NULL DEFAULT FALSE,
+      facts TEXT,
       genlayer_tx_hash TEXT,
       genlayer_contract_address TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
@@ -86,8 +93,12 @@ async function migrate() {
       verdict_id TEXT REFERENCES verdicts(verdict_id),
       severity TEXT NOT NULL,
       reason TEXT,
-      status TEXT NOT NULL DEFAULT 'EXECUTED',
+      status TEXT NOT NULL DEFAULT 'PENDING_HOST_REVOCATION',
+      host_state TEXT NOT NULL DEFAULT 'PENDING_HOST',
       evm_tx_hash TEXT,
+      evm_block_number TEXT,
+      confirm_tx_hash TEXT,
+      watcher TEXT,
       genlayer_tx_hash TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -102,7 +113,15 @@ async function migrate() {
       revocation_id TEXT NOT NULL REFERENCES revocations(revocation_id),
       appeal_reason TEXT NOT NULL,
       bond_amount TEXT NOT NULL DEFAULT '0',
+      bond_wei TEXT NOT NULL DEFAULT '0',
+      bond_settlement TEXT,
+      bond_paid_to TEXT,
+      appellant TEXT,
+      watcher TEXT,
       status TEXT NOT NULL DEFAULT 'PENDING',
+      restoration_state TEXT NOT NULL DEFAULT 'NONE',
+      restoration_tx_hash TEXT,
+      restoration_confirm_tx_hash TEXT,
       adjudication_result TEXT,
       genlayer_tx_hash TEXT,
       filed_by TEXT,
@@ -125,6 +144,37 @@ async function migrate() {
   `);
   console.log("Created users table");
 
+  // The tables above already exist on any deployment that has run before, so
+  // CREATE TABLE IF NOT EXISTS silently skips the new columns. Add them here so
+  // a migration is safe to re-run against either an empty or a live database.
+  const additions = [
+    ["mandates", "host_registry", "TEXT"],
+    ["mandates", "host_delegation_id", "TEXT"],
+    ["mandates", "host_open_tx_hash", "TEXT"],
+    ["mandates", "host_status", "TEXT NOT NULL DEFAULT 'PENDING'"],
+    ["actions", "review_attempts", "INTEGER NOT NULL DEFAULT 1"],
+    ["verdicts", "attributed", "BOOLEAN NOT NULL DEFAULT FALSE"],
+    ["verdicts", "facts", "TEXT"],
+    ["revocations", "host_state", "TEXT NOT NULL DEFAULT 'PENDING_HOST'"],
+    ["revocations", "evm_block_number", "TEXT"],
+    ["revocations", "confirm_tx_hash", "TEXT"],
+    ["revocations", "watcher", "TEXT"],
+    ["appeals", "bond_wei", "TEXT NOT NULL DEFAULT '0'"],
+    ["appeals", "bond_settlement", "TEXT"],
+    ["appeals", "bond_paid_to", "TEXT"],
+    ["appeals", "appellant", "TEXT"],
+    ["appeals", "watcher", "TEXT"],
+    ["appeals", "restoration_state", "TEXT NOT NULL DEFAULT 'NONE'"],
+    ["appeals", "restoration_tx_hash", "TEXT"],
+    ["appeals", "restoration_confirm_tx_hash", "TEXT"],
+  ];
+  for (const [table, column, type] of additions) {
+    await client.query(
+      `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${type};`
+    );
+  }
+  console.log(`Added ${additions.length} columns where missing`);
+
   // Indexes for performance
   await client.query(`CREATE INDEX IF NOT EXISTS idx_mandates_delegator ON mandates(delegator);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_mandates_status ON mandates(status);`);
@@ -132,6 +182,8 @@ async function migrate() {
   await client.query(`CREATE INDEX IF NOT EXISTS idx_verdicts_delegation ON verdicts(delegation_id);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_revocations_delegation ON revocations(delegation_id);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_appeals_revocation ON appeals(revocation_id);`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_revocations_verdict ON revocations(verdict_id);`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_revocations_host_state ON revocations(host_state);`);
   console.log("Created indexes");
 
   await client.end();

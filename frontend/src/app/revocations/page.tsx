@@ -5,8 +5,22 @@ import { usePrivy } from '@privy-io/react-auth';
 import { api } from '@/lib/api';
 import { motion } from 'framer-motion';
 import Link from 'next/link';
-import { Ban, ExternalLink, ShieldAlert, ArrowUpRight } from 'lucide-react';
+import { Ban, Clock, ExternalLink, ShieldAlert, ArrowUpRight } from 'lucide-react';
 import { SeverityBadge } from '@/components/ui/SeverityBadge';
+
+// A revocation is only real once the host chain has stopped the session key.
+// Until then the court has ruled and the mandate is flagged, which is a
+// different thing, and this page used to label both of them REVOKED.
+const CONFIRMED = 'REVOKED';
+
+function hostExplorerTx(chainId: string | undefined, hash: string) {
+  if (chainId === '11155111') return `https://sepolia.etherscan.io/tx/${hash}`;
+  if (chainId === '1') return `https://etherscan.io/tx/${hash}`;
+  if (chainId === '8453') return `https://basescan.org/tx/${hash}`;
+  if (chainId === '137') return `https://polygonscan.com/tx/${hash}`;
+  if (chainId === '42161') return `https://arbiscan.io/tx/${hash}`;
+  return '';
+}
 
 export default function RevocationsPage() {
   const { getAccessToken } = usePrivy();
@@ -43,27 +57,41 @@ export default function RevocationsPage() {
       <div>
         <h2 className="font-mono text-sm text-neutral-300">enforced revocations</h2>
         <p className="text-xs text-neutral-500">
-          When an agent commits an irreconcilable breach, authority is revoked on GenLayer and disabled on the host chain.
+          A breach verdict flags the delegation. The authority is gone only once
+          the session key has been switched off on the host chain and the Enforcer
+          has read that transaction back.
         </p>
       </div>
 
       {revocations.length > 0 ? (
         <div className="grid gap-4">
-          {revocations.map(r => (
+          {revocations.map(r => {
+            const confirmed = r.host_state === CONFIRMED;
+            const explorerUrl = r.evm_tx_hash ? hostExplorerTx(r.chain_id, r.evm_tx_hash) : '';
+            return (
             <motion.div
               key={r.revocation_id}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.3 }}
-              className="relative overflow-hidden border border-[#eb1700]/40 rounded-sm p-6 bg-[#1f1f1f]"
+              className={`relative overflow-hidden border rounded-sm p-6 bg-[#1f1f1f] ${
+                confirmed ? 'border-[#eb1700]/40' : 'border-amber-500/40'
+              }`}
             >
               <div className="flex flex-col md:flex-row justify-between gap-6 relative z-10">
                 <div className="space-y-4 flex-1">
                   <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-1.5 text-[#eb1700] font-mono text-xs font-semibold">
-                      <Ban size={16} />
-                      REVOKED
-                    </div>
+                    {confirmed ? (
+                      <div className="flex items-center gap-1.5 text-[#eb1700] font-mono text-xs font-semibold">
+                        <Ban size={16} />
+                        REVOKED
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5 text-amber-400 font-mono text-xs font-semibold">
+                        <Clock size={16} />
+                        FLAGGED &middot; AWAITING HOST CHAIN
+                      </div>
+                    )}
                     {r.severity && <SeverityBadge severity={r.severity} />}
                     <span className="text-xs font-mono text-neutral-500">
                       ID: {r.revocation_id}
@@ -88,19 +116,30 @@ export default function RevocationsPage() {
                       </div>
                     </div>
 
-                    {r.evm_tx_hash ? (
+                    {confirmed && r.evm_tx_hash ? (
                       <div className="space-y-1">
-                        <span className="text-neutral-500">EVM host chain revocation tx</span>
-                        <div className="bg-black/30 px-3 py-1.5 rounded-sm flex items-center justify-between text-neutral-300">
-                          <span className="truncate">{`${r.evm_tx_hash.slice(0, 10)}...${r.evm_tx_hash.slice(-8)}`}</span>
-                          <ExternalLink size={12} className="text-neutral-500 shrink-0 ml-2" />
-                        </div>
+                        <span className="text-neutral-500">host chain revocation tx</span>
+                        {explorerUrl ? (
+                          <a
+                            href={explorerUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="bg-black/30 px-3 py-1.5 rounded-sm flex items-center justify-between text-neutral-300 hover:text-white transition-colors"
+                          >
+                            <span className="truncate">{`${r.evm_tx_hash.slice(0, 10)}...${r.evm_tx_hash.slice(-8)}`}</span>
+                            <ExternalLink size={12} className="text-neutral-500 shrink-0 ml-2" />
+                          </a>
+                        ) : (
+                          <div className="bg-black/30 px-3 py-1.5 rounded-sm text-neutral-300 truncate">
+                            {`${r.evm_tx_hash.slice(0, 10)}...${r.evm_tx_hash.slice(-8)}`}
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <div className="space-y-1">
-                        <span className="text-neutral-500">EVM host chain state</span>
-                        <div className="bg-black/30 px-3 py-1.5 rounded-sm text-amber-400">
-                          Relayer execution recorded
+                        <span className="text-neutral-500">host chain state</span>
+                        <div className="bg-black/30 px-3 py-1.5 rounded-sm text-amber-400 truncate">
+                          {(r.host_state || 'PENDING_HOST').replace(/_/g, ' ').toLowerCase()}
                         </div>
                       </div>
                     )}
@@ -121,17 +160,24 @@ export default function RevocationsPage() {
                   <span className="text-xs font-mono text-neutral-500">
                     {r.created_at ? new Date(r.created_at).toLocaleDateString() : ''}
                   </span>
-                  <Link
-                    href={`/appeals?revocationId=${r.revocation_id}`}
-                    className="inline-flex items-center gap-1.5 bg-white text-[#191919] hover:bg-neutral-200 font-mono text-xs px-3.5 py-2 rounded-sm transition-colors"
-                  >
-                    Post bond and appeal
-                    <ArrowUpRight size={12} />
-                  </Link>
+                  {confirmed ? (
+                    <Link
+                      href={`/appeals?revocationId=${r.revocation_id}`}
+                      className="inline-flex items-center gap-1.5 bg-white text-[#191919] hover:bg-neutral-200 font-mono text-xs px-3.5 py-2 rounded-sm transition-colors"
+                    >
+                      Post bond and appeal
+                      <ArrowUpRight size={12} />
+                    </Link>
+                  ) : (
+                    <span className="text-[11px] font-mono text-neutral-600 text-right max-w-[11rem]">
+                      Appealable once the revocation is confirmed on chain.
+                    </span>
+                  )}
                 </div>
               </div>
             </motion.div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         <div className="text-center py-16 bg-[#1f1f1f] border border-[#2a2a2a] rounded-sm">

@@ -12,6 +12,17 @@ dotenv.config();
 const RPC_URL = process.env.GENLAYER_RPC_URL || "https://studio.genlayer.com/api";
 const DEPLOYER = process.env.GENLAYER_DEPLOYER_ADDRESS || "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53";
 const PRIV_KEY = process.env.GENLAYER_PRIVATE_KEY;
+// Gas ceiling for a GenLayer transaction.
+//
+// StudioNet prices gas at zero, so a generous ceiling costs nothing, and the
+// old 5,000,000 was not generous enough for `review_action`: a cross-contract
+// read, a web fetch and an LLM prompt in one transaction exhausted it. A leader
+// that runs out of gas produces no receipt at all, so the transaction came back
+// with zero leader receipts, zero validator receipts, three recovery cycles and
+// `NO_MAJORITY` -- which reads exactly like a disagreement, and sent the
+// investigation after the comparison rule instead of the limit.
+const GAS_LIMIT = process.env.GENLAYER_GAS_LIMIT || "0x5F5E100"; // 100,000,000
+
 const POLL_MS = 3000;
 const MAX_POLLS = 80;
 
@@ -63,14 +74,14 @@ async function deployContract(contractPath, contractName, constructorArgs = []) 
           to: tx.to ?? null,
           data: tx.data,
           value: tx.value ?? "0x0",
-          gas: tx.gas ?? "0x4C4B40",
+          gas: tx.gas ?? GAS_LIMIT,
           gasPrice: tx.gasPrice ?? "0x0",
           nonce,
           chainId: parseInt(chainId, 16),
         });
         return rpc("eth_sendRawTransaction", [signed]);
       }
-      if (method === "eth_estimateGas") return "0x4C4B40";
+      if (method === "eth_estimateGas") return GAS_LIMIT;
       return rpc(method, params);
     },
   };
@@ -123,7 +134,39 @@ async function deployContract(contractPath, contractName, constructorArgs = []) 
   return newAddress;
 }
 
+function makeClient() {
+  const wallet = new ethers.Wallet(PRIV_KEY);
+  const provider = {
+    async request({ method, params = [] }) {
+      if (method === "eth_sendTransaction") {
+        const tx = params[0];
+        const nonce = await rpc("eth_getTransactionCount", [DEPLOYER, "latest"]);
+        const chainId = await rpc("eth_chainId", []);
+        const signed = await wallet.signTransaction({
+          to: tx.to ?? null,
+          data: tx.data,
+          value: tx.value ?? "0x0",
+          gas: tx.gas ?? GAS_LIMIT,
+          gasPrice: tx.gasPrice ?? "0x0",
+          nonce,
+          chainId: parseInt(chainId, 16),
+        });
+        return rpc("eth_sendRawTransaction", [signed]);
+      }
+      if (method === "eth_estimateGas") return GAS_LIMIT;
+      return rpc(method, params);
+    },
+  };
+  return createClient({
+    chain: chains.studionet,
+    endpoint: RPC_URL,
+    account: DEPLOYER,
+    provider,
+  });
+}
+
 async function main() {
+  const client = makeClient();
   console.log("REIN Contract Deployment");
   console.log("========================\n");
   console.log(`RPC: ${RPC_URL}`);
@@ -155,17 +198,63 @@ async function main() {
   );
   if (!addresses.enforcer) process.exit(1);
 
+  // Wire the registry to the two contracts allowed to act on it. Without this
+  // the court cannot count reviewed actions and, more importantly, the enforcer
+  // cannot revoke or restore: the registry would see an unknown caller. The
+  // contracts are deployed in dependency order, so this has to happen after.
+  console.log("\nWiring MandateRegistry to the court and enforcer...");
+  for (const [fn, arg] of [
+    ["set_court", addresses.reinCourt],
+    ["set_enforcer", addresses.enforcer],
+  ]) {
+    const hash = await client.writeContract({
+      address: addresses.mandateRegistry,
+      functionName: fn,
+      args: [arg],
+      value: BigInt(0),
+    });
+    console.log(`  ${fn}(${arg}) -> ${hash}`);
+    const status = await pollStatus(hash);
+    if (status !== "finalized") {
+      console.error(`  ${fn} did not finalize (${status}); the registry is not wired.`);
+      process.exit(1);
+    }
+  }
+
+  // Prove the wiring took, rather than trusting the transaction status.
+  const wiring = await client.readContract({
+    address: addresses.mandateRegistry,
+    functionName: "get_wiring",
+    args: [],
+  });
+  console.log(`  wiring reads back as: ${wiring}`);
+  const parsed = JSON.parse(wiring);
+  if (
+    parsed.court?.toLowerCase() !== addresses.reinCourt.toLowerCase() ||
+    parsed.enforcer?.toLowerCase() !== addresses.enforcer.toLowerCase()
+  ) {
+    console.error("  Wiring did not take. Revocations would be rejected by the registry.");
+    process.exit(1);
+  }
+
   console.log("\n\nAll contracts deployed successfully!");
   console.log("===================================");
   console.log(`MANDATE_REGISTRY_ADDRESS=${addresses.mandateRegistry}`);
   console.log(`REIN_COURT_ADDRESS=${addresses.reinCourt}`);
   console.log(`ENFORCER_ADDRESS=${addresses.enforcer}`);
 
-  // Write addresses to a JSON file for the frontend/backend to use
+  // Write addresses to a JSON file for the frontend/backend to use. Merge
+  // rather than overwrite: this file also records the host-chain registry, and
+  // rewriting it wholesale on a GenLayer redeploy silently dropped the address
+  // and deploy block that revocation depends on.
   const addressFile = new URL("../../deployed_addresses.json", import.meta.url).pathname;
+  let existing = {};
+  try {
+    existing = JSON.parse(readFileSync(addressFile, "utf8"));
+  } catch {}
   writeFileSync(
     addressFile,
-    JSON.stringify(addresses, null, 2)
+    JSON.stringify({ ...existing, ...addresses }, null, 2) + "\n"
   );
   console.log(`\nAddresses written to ${addressFile}`);
 

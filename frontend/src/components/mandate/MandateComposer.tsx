@@ -1,19 +1,17 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { usePrivy } from '@privy-io/react-auth';
 import { Shield, Coins, AlertTriangle } from 'lucide-react';
 
-const CHAINS = [
-  { id: '1', name: 'Ethereum' },
-  { id: '8453', name: 'Base' },
-  { id: '11155111', name: 'Sepolia' },
-  { id: '137', name: 'Polygon' },
-  { id: '42161', name: 'Arbitrum' },
-  { id: '10', name: 'Optimism' },
-];
+// The chain a mandate can be registered on is the chain REIN can enforce on:
+// the court needs a block explorer it can read evidence from, and the enforcer
+// needs the ReinSessionKeyRegistry deployment whose guardian it is. Offering
+// chains with neither produced mandates that could be written and never acted
+// on, so the list is what this deployment actually governs.
+const ENFORCED_CHAIN = { id: '11155111', name: 'Ethereum Sepolia' };
 
 function toWei(amount: string, unit: string): string {
   if (!amount) return '0';
@@ -36,9 +34,16 @@ export function MandateComposer() {
     mandateText: '',
     spendCeiling: '',
     unit: 'ETH',
-    chainId: '1',
     sessionKeyId: '',
   });
+  const [host, setHost] = useState<{ sessionKeyRegistry: string | null; configured: boolean } | null>(null);
+
+  useEffect(() => {
+    api
+      .getHealth()
+      .then((h) => setHost(h.host_chain))
+      .catch(() => setHost(null));
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,7 +61,7 @@ export function MandateComposer() {
         agent_address: formData.agentAddress,
         mandate_text: formData.mandateText,
         spend_ceiling_wei: spendWei,
-        chain_id: formData.chainId,
+        chain_id: ENFORCED_CHAIN.id,
         session_key_id: formData.sessionKeyId,
       });
       router.push('/mandates');
@@ -134,28 +139,41 @@ export function MandateComposer() {
 
           <div>
             <label className="block text-xs font-mono text-neutral-500 mb-1.5">network</label>
-            <select
-              required
-              value={formData.chainId}
-              onChange={(e) => setFormData({ ...formData, chainId: e.target.value })}
-              className="w-full bg-transparent border border-[#2a2a2a] rounded-sm px-4 py-2.5 text-sm font-mono text-white focus:outline-none focus:border-[#eb1700]/50 focus:ring-1 focus:ring-[#eb1700]/30 transition-colors"
-            >
-              {CHAINS.map(c => (
-                <option key={c.id} value={c.id} className="bg-[#191919]">{c.name} ({c.id})</option>
-              ))}
-            </select>
+            <div className="w-full border border-[#2a2a2a] rounded-sm px-4 py-2.5 text-sm font-mono text-neutral-300 bg-[#1f1f1f]">
+              {ENFORCED_CHAIN.name} ({ENFORCED_CHAIN.id})
+            </div>
+            <p className="text-[11px] text-neutral-600 mt-1.5">
+              The chain this deployment can revoke on.
+            </p>
           </div>
         </div>
 
         <div>
-          <label className="block text-xs font-mono text-neutral-500 mb-1.5">session key / delegation id (optional)</label>
+          <label className="block text-xs font-mono text-neutral-500 mb-1.5">session key address</label>
           <input
+            required
             type="text"
             value={formData.sessionKeyId}
             onChange={(e) => setFormData({ ...formData, sessionKeyId: e.target.value })}
             className="w-full bg-transparent border border-[#2a2a2a] rounded-sm px-4 py-2.5 font-mono text-sm text-white placeholder:text-neutral-600 focus:outline-none focus:border-[#eb1700]/50 focus:ring-1 focus:ring-[#eb1700]/30 transition-colors"
-            placeholder="ERC-7710 delegation ID or session key reference"
+            placeholder="0x... the key your agent signs spends with"
           />
+          <p className="text-[11px] text-neutral-600 mt-1.5">
+            This is the key a revocation switches off. It is registered against
+            the delegation on{' '}
+            <span className="font-mono">
+              {host?.sessionKeyRegistry
+                ? `${host.sessionKeyRegistry.slice(0, 10)}...${host.sessionKeyRegistry.slice(-6)}`
+                : 'the session key registry'}
+            </span>
+            , and after a breach verdict it can no longer spend from it.
+          </p>
+          {host && !host.configured && (
+            <p className="text-[11px] text-amber-400 mt-1.5">
+              The host chain is not configured on this deployment, so a mandate
+              registered now could not be enforced.
+            </p>
+          )}
         </div>
 
         <button
@@ -175,11 +193,12 @@ export function MandateComposer() {
             What the hard caps catch
           </div>
           <p className="text-xs text-neutral-500 leading-relaxed">
-            Deterministic guardrails. If your agent tries to spend more than{' '}
+            Deterministic guardrails, enforced on chain. The session key spends
+            through the registry, which rejects anything over{' '}
             <span className="font-mono text-neutral-400">
               {formData.spendCeiling || '___'} {formData.unit}
-            </span>
-            , it gets stopped before the transaction even hits the chain. No judgement needed, just math.
+            </span>{' '}
+            in total. No judgement needed, just math.
           </p>
         </div>
 
@@ -190,7 +209,7 @@ export function MandateComposer() {
           </div>
           <p className="text-xs text-neutral-500 leading-relaxed">
             {formData.mandateText.trim()
-              ? 'GenLayer validators will read your mandate text and independently judge whether each agent action stays within the spirit of what you wrote. Numbers can\'t express this. Language can.'
+              ? 'GenLayer validators read this exact text, fetch the transaction independently, and judge whether the action stayed within the spirit of what you wrote. On a confirmed breach the session key above is revoked on chain. Numbers can\'t express this. Language can.'
               : 'Write your mandate above and the GenLayer network will interpret your intent. This is the part that makes REIN different from a simple spend cap.'}
           </p>
         </div>

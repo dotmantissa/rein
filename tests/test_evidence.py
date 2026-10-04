@@ -11,15 +11,26 @@ became the evidence and the working fallback was never reached.
 
 import json
 import pytest
-from contracts.rein_court import ReinCourt, _extract_tx_facts
-from tests.conftest import mock_gl, FakeResponse, judge_leader_only
+
+from contracts.rein_court import NO_EVIDENCE, _extract_tx_facts, _fetch_facts
+from tests.builders import (
+    AGENT,
+    MANDATE,
+    deploy_stack,
+    explorer_handler,
+    register,
+    run_review,
+    verdict_prompt,
+)
+from tests.conftest import world
 
 TX = "0xb740caf4efcbf64e9c39b403b4ea1b6974e721969a893a994b95ad1038c140f3"
+SEPOLIA = ["https://eth-sepolia.blockscout.com/api/v2/transactions/"]
 
 # Trimmed from a real eth.blockscout.com response for the transaction above.
 REAL_BODY = json.dumps({
     "hash": TX,
-    "from": {"hash": "0x2Ff47E818Bf4798d0639F9d75Af2d5fD55eC3c78", "is_contract": False},
+    "from": {"hash": AGENT, "is_contract": False},
     "to": {"hash": "0xb6E0EdaEfC86338a9ed27f794624096e4a341ED7", "is_contract": False},
     "value": "37407860000000000000",
     "gas_used": "21000",
@@ -57,16 +68,6 @@ def facts_block(prompt: str) -> str:
     raise AssertionError("no facts block in prompt")
 
 
-def make_court():
-    court = ReinCourt.__new__(ReinCourt)
-    court.owner = "owner_addr"
-    court.registry_address = "0xRegistryAddr"
-    court.verdicts = {}
-    court.verdict_ids = []
-    court.total_verdicts = 0
-    return court
-
-
 def test_deprecated_endpoint_error_is_not_evidence():
     # A 200 carrying an error body must not pass as a transaction record.
     assert _extract_tx_facts(ETHERSCAN_V1_ERROR, TX) == ""
@@ -91,7 +92,7 @@ def test_facts_are_extracted_from_a_real_response():
     assert facts["status"] == "ok"
     # Addresses arrive as objects and must be flattened, and lowercased so two
     # validators cannot disagree over checksum casing.
-    assert facts["from"] == "0x2ff47e818bf4798d0639f9d75af2d5fd55ec3c78"
+    assert facts["from"] == AGENT.lower()
     assert facts["to"] == "0xb6e0edaefc86338a9ed27f794624096e4a341ed7"
 
 
@@ -177,50 +178,59 @@ def test_token_symbols_reach_the_judge():
 
 def test_unreachable_explorer_yields_the_shared_sentinel():
     """
-    When nothing can be verified, every validator must prompt on identical text.
-    Letting each one embed its own error page is how they end up disagreeing.
+    When nothing can be verified, every validator must derive identical text.
+    Letting each one embed its own error page is how they end up disagreeing,
+    and it is how an error page became the evidence in the first place.
     """
-    court = make_court()
-    mock_gl.nondet.web.get.return_value = FakeResponse(ETHERSCAN_V1_ERROR, status=200)
-    mock_gl.nondet.exec_prompt.return_value = ({
-        "verdict": "ambiguous", "severity": "LOW", "breached_clause": None,
-        "reasoning": "No verifiable transaction data was available.", "confidence": 0.1,
-    })
-    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
+    w = world()
+    registry, court, _ = deploy_stack(w)
+    did = register(w, registry)
+    w.http = explorer_handler(ETHERSCAN_V1_ERROR, status=200)
+    w.prompt = verdict_prompt()
 
-    court.review_action("del_1", TX, "1", "Agent did something", "Never do anything")
+    v = run_review(w, court, did, description="Agent did something")
 
-    prompt = mock_gl.nondet.exec_prompt.call_args[0][0]
-    assert facts_block(prompt) == court.NO_EVIDENCE
-    # The error page itself must not leak in as evidence.
-    assert "NOTOK" not in prompt
-    assert "deprecated" not in prompt
+    assert v["facts"] == NO_EVIDENCE
+    assert v["verdict"] == "ambiguous"
+    # No prompt is spent on an unjudgeable action, so the error page cannot
+    # reach a judge even as noise.
+    assert w.prompts == []
+
+
+def test_the_fetcher_rejects_the_deprecated_endpoint_body():
+    w = world()
+    deploy_stack(w)
+    w.http = explorer_handler(ETHERSCAN_V1_ERROR, status=200)
+    assert _fetch_facts(SEPOLIA, TX) == NO_EVIDENCE
+
+    w.http = explorer_handler(REAL_BODY)
+    assert json.loads(_fetch_facts(SEPOLIA, TX))["hash"] == TX
 
 
 def test_judge_sees_facts_and_not_the_raw_response():
-    court = make_court()
-    mock_gl.nondet.web.get.return_value = FakeResponse(REAL_BODY)
-    mock_gl.nondet.exec_prompt.return_value = ({
-        "verdict": "breach", "severity": "HIGH",
-        "breached_clause": "never move more than 1 ETH in a single transaction",
-        "reasoning": "The transaction moved 37.4 ETH.", "confidence": 0.98,
-    })
-    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
+    w = world()
+    registry, court, _ = deploy_stack(w)
+    did = register(w, registry)
+    w.http = explorer_handler(REAL_BODY)
+    w.prompt = verdict_prompt(
+        verdict="breach",
+        severity="HIGH",
+        clause="Never move more than 1 ETH in a single transaction",
+        reasoning="The transaction moved 37.4 ETH.",
+        confidence=0.98,
+    )
 
-    result = json.loads(court.review_action(
-        "del_2", TX, "1", "Agent moved funds",
-        "It must never move more than 1 ETH in a single transaction.",
-    ))
+    v = run_review(w, court, did, description="Agent moved funds")
 
-    prompt = mock_gl.nondet.exec_prompt.call_args[0][0]
+    prompt = w.prompts[0]
     facts = facts_block(prompt)
-    assert facts.startswith("{")                    # real evidence, not the sentinel
-    assert facts != court.NO_EVIDENCE
+    assert facts.startswith("{")                    # real evidence, not a sentinel
+    assert facts != NO_EVIDENCE
     assert "37407860000000000000" in facts          # the fact that decides it
     assert "confirmations" not in prompt            # volatile noise, excluded
     assert "timestamp" not in facts
-    assert result["verdict"] == "breach"
-    assert court.total_verdicts == 1
+    assert v["verdict"] == "breach"
+    assert w.call(court, "get_verdict_count") == 1
 
 
 def test_description_alone_cannot_manufacture_a_breach():
@@ -228,16 +238,15 @@ def test_description_alone_cannot_manufacture_a_breach():
     The submitter's description is an unverified claim. The prompt has to say so,
     or the contract is just restating whoever filed the review.
     """
-    court = make_court()
-    mock_gl.nondet.web.get.return_value = FakeResponse(REAL_BODY)
-    mock_gl.nondet.exec_prompt.return_value = ({
-        "verdict": "compliant", "severity": "LOW", "breached_clause": None,
-        "reasoning": "ok", "confidence": 0.9,
-    })
-    mock_gl.eq_principle.prompt_non_comparative.side_effect = judge_leader_only
+    w = world()
+    registry, court, _ = deploy_stack(w)
+    did = register(w, registry)
+    w.http = explorer_handler(REAL_BODY)
+    w.prompt = verdict_prompt(verdict="compliant", clause=None, severity="LOW")
 
-    court.review_action("del_3", TX, "1", "Agent stole everything", "Do not steal")
+    run_review(w, court, did, description="Agent stole everything")
 
-    prompt = mock_gl.nondet.exec_prompt.call_args[0][0]
+    prompt = w.prompts[0]
     assert "unverified" in prompt.lower()
     assert "never treat it as proof" in prompt
+    assert MANDATE in prompt

@@ -46,3 +46,10 @@ task_checklist.md
 
 # Vercel
 .vercel/
+
+# Session working state, never committed
+.task-checklist.md
+
+# Local GenVM test venv (real SDK needs Python 3.12)
+.venv-genvm/
+artifacts/

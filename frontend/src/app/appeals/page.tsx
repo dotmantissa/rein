@@ -23,8 +23,19 @@ function AppealsContent() {
   const [formData, setFormData] = useState({
     revocation_id: prefillRevocationId || '',
     appeal_reason: '',
-    bond_amount: '0.1',
   });
+  // The bond is a fixed amount of native value the relayer sends with the call
+  // and the Enforcer escrows. It was a number typed into this form that nothing
+  // ever collected, which made both halves of the published appeal economics
+  // claims about nothing.
+  const [bondWei, setBondWei] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .getHealth()
+      .then((h) => setBondWei(h.appeal_bond_wei))
+      .catch(() => setBondWei(null));
+  }, []);
 
   const loadAppeals = useCallback(async () => {
     try {
@@ -55,17 +66,29 @@ function AppealsContent() {
       await api.createAppeal(token, {
         revocation_id: formData.revocation_id,
         appeal_reason: formData.appeal_reason,
-        bond_amount: formData.bond_amount,
       });
 
       setFormVisible(false);
-      setFormData({ revocation_id: '', appeal_reason: '', bond_amount: '0.1' });
+      setFormData({ revocation_id: '', appeal_reason: '' });
       await loadAppeals();
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Failed to submit appeal.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // Appeals are filed against a confirmed revocation, so the bond is denominated
+  // in the native token of the chain the Enforcer runs on.
+  const formatBond = (wei: string) => {
+    try {
+      const n = BigInt(wei);
+      const whole = n / 10n ** 18n;
+      const frac = (n % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '');
+      return frac ? `${whole}.${frac}` : `${whole}`;
+    } catch {
+      return wei;
     }
   };
 
@@ -113,7 +136,9 @@ function AppealsContent() {
         <div>
           <h2 className="font-mono text-sm text-neutral-300">appeals court</h2>
           <p className="text-xs text-neutral-500">
-            Challenge revocation decisions before an independent GenLayer validator panel with bonded stake.
+            Challenge a confirmed revocation before a fresh GenLayer validator
+            panel. The panel re-reads the registered mandate and the verified
+            on-chain facts the original verdict was reached on.
           </p>
         </div>
 
@@ -165,19 +190,17 @@ function AppealsContent() {
               />
             </div>
 
-            <div>
-              <label className="block text-xs font-mono text-neutral-500 mb-1.5">bond amount in ETH</label>
-              <input
-                required
-                type="number"
-                step="0.01"
-                min="0.01"
-                value={formData.bond_amount}
-                onChange={(e) => setFormData({ ...formData, bond_amount: e.target.value })}
-                className="w-full bg-transparent border border-[#2a2a2a] rounded-sm px-4 py-2.5 font-mono text-sm text-white focus:outline-none focus:border-[#eb1700]/50 focus:ring-1 focus:ring-[#eb1700]/30 transition-colors"
-              />
-              <p className="text-xs text-neutral-500 mt-1">
-                Bond is returned in full if overturned. Upheld appeals forfeit bond to the bounty watcher.
+            <div className="border border-[#2a2a2a] rounded-sm p-4 bg-black/20 space-y-1.5">
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="text-xs font-mono text-neutral-500">bond posted with this appeal</span>
+                <span className="text-sm font-mono text-neutral-200">
+                  {bondWei ? `${formatBond(bondWei)} GEN` : '...'}
+                </span>
+              </div>
+              <p className="text-xs text-neutral-500 leading-relaxed">
+                Escrowed by the Enforcer contract when the appeal is filed.
+                Returned in full if the revocation is overturned. Awarded to the
+                watcher who flagged the breach if it is upheld.
               </p>
             </div>
 
@@ -217,7 +240,8 @@ function AppealsContent() {
                     <StatusBadge status={a.status || 'PENDING'} />
                   </div>
                   <span className="font-mono text-xs text-neutral-500">
-                    Bond: {a.bond_amount} ETH
+                    Bond: {formatBond(a.bond_wei || a.bond_amount || '0')} GEN
+                    {a.bond_settlement ? ` · ${a.bond_settlement.replace(/_/g, ' ').toLowerCase()}` : ''}
                   </span>
                 </div>
 
@@ -240,6 +264,27 @@ function AppealsContent() {
                     }`}>
                       {a.adjudication_result}
                     </p>
+                  </div>
+                )}
+
+                {isOverturned && (
+                  <div className="space-y-1">
+                    <span className="text-xs font-mono text-neutral-500">host chain restoration</span>
+                    {a.restoration_state === 'RESTORED' ? (
+                      <p className="text-sm font-mono text-green-300">
+                        Restored. The agent&rsquo;s session key can spend again.
+                        {a.restoration_tx_hash
+                          ? ` tx ${a.restoration_tx_hash.slice(0, 12)}...${a.restoration_tx_hash.slice(-8)}`
+                          : ''}
+                      </p>
+                    ) : (
+                      <p className="text-sm font-mono text-amber-400">
+                        Pending ({(a.restoration_state || 'PENDING_HOST_RESTORE')
+                          .replace(/_/g, ' ')
+                          .toLowerCase()}). The bond is back, but the key stays
+                        revoked until the restoration lands on chain.
+                      </p>
+                    )}
                   </div>
                 )}
 

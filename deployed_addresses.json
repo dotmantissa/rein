@@ -1,5 +1,12 @@
 {
-  "mandateRegistry": "0x6095A434697A725467fA13aB7636978F0427A2E0",
-  "reinCourt": "0xf8999cE10cB9FF8486D3F28F03C0714c2B314216",
-  "enforcer": "0x5A16fd9454046CB208b589c82d4c96849Cf3F4ae"
+  "mandateRegistry": "0x05218492091D077eb843224D0A4113837380a604",
+  "reinCourt": "0x6Ce4415Cb5c90Eba675b40d8Ceb99d183882C9f2",
+  "enforcer": "0xd567EE760297Da0a378828ad849Af21A03d1B447",
+  "hostChain": {
+    "chainId": "11155111",
+    "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+    "sessionKeyRegistry": "0xD20055953d51EFb3612CAc51CfE1d6C29Fd592d5",
+    "guardian": "0xBC1399c55538eC034d4Da550C03c34Ae0C357f53",
+    "deployBlock": 11832925
+  }
 }

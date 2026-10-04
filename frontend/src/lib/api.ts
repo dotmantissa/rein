@@ -28,14 +28,29 @@ export const api = {
     fetchApi<{ user: any }>('/api/users/me', token),
 
   // Mandates
+  // session_key_id is required: it is the host-chain key REIN revokes, and a
+  // mandate without one would be unenforceable.
   createMandate: (token: string, data: {
     delegator: string;
     agent_address: string;
     mandate_text: string;
+    session_key_id: string;
     spend_ceiling_wei?: string;
     chain_id?: string;
-    session_key_id?: string;
-  }) => fetchApi<{ mandate: any; genlayer_tx_hash: string }>('/api/mandates', token, { method: 'POST', body: JSON.stringify(data) }),
+  }) => fetchApi<{ mandate: any; genlayer_tx_hash: string; host_chain: any }>('/api/mandates', token, { method: 'POST', body: JSON.stringify(data) }),
+
+  // What ReinSessionKeyRegistry on the host chain says about this delegation.
+  // `active: false` means the agent's session key cannot spend, whatever any
+  // database says.
+  getHostStatus: (token: string, delegationId: string) =>
+    fetchApi<{
+      delegation_id: string;
+      handle: string;
+      active: boolean;
+      delegation: any;
+      chainId: string;
+      sessionKeyRegistry: string | null;
+    }>(`/api/mandates/${delegationId}/host`, token),
 
   getMandates: (token: string) =>
     fetchApi<{ mandates: any[] }>('/api/mandates', token),
@@ -44,10 +59,11 @@ export const api = {
     fetchApi<{ mandate: any }>(`/api/mandates/${delegationId}`, token),
 
   // Actions / Review
+  // No chain_id and no mandate text: the court reads both from MandateRegistry
+  // so a review is bound to the delegation that was actually registered.
   reviewAction: (token: string, data: {
     delegation_id: string;
     tx_hash: string;
-    chain_id?: string;
     action_description?: string;
   }) => fetchApi<{ action_id: string; status: string; verdict: any; revocation: any; genlayer_tx_hash: string }>('/api/actions/review', token, { method: 'POST', body: JSON.stringify(data) }),
 
@@ -66,20 +82,41 @@ export const api = {
     fetchApi<{ revocations: any[] }>('/api/revocations', token),
 
   // Appeals
+  // The bond is not a parameter. It is a fixed amount of native value the
+  // relayer sends with the call and the Enforcer escrows, so it cannot be
+  // declared as a number that nothing collects.
   createAppeal: (token: string, data: {
     revocation_id: string;
     appeal_reason: string;
-    bond_amount?: string;
-  }) => fetchApi<{ appeal_id: string; appeal: any; genlayer_tx_hash: string }>('/api/appeals', token, { method: 'POST', body: JSON.stringify(data) }),
+  }) => fetchApi<{ appeal_id: string; appeal: any; bond_wei: string; genlayer_tx_hash: string }>('/api/appeals', token, { method: 'POST', body: JSON.stringify(data) }),
 
   adjudicateAppeal: (token: string, appealId: string) =>
     fetchApi<{ appeal_id: string; status: string; genlayer_tx_hash: string }>(`/api/appeals/${appealId}/adjudicate`, token, { method: 'POST', body: JSON.stringify({}) }),
 
   getAppealStatus: (token: string, appealId: string) =>
-    fetchApi<{ appeal_id: string; status: string; adjudication: any; genlayer_tx_hash: string }>(`/api/appeals/${appealId}/status`, token),
+    fetchApi<{
+      appeal_id: string;
+      status: string;
+      adjudication: any;
+      restoration_state?: string;
+      restoration_tx_hash?: string;
+      bond_settlement?: string;
+      bond_paid_to?: string;
+      genlayer_tx_hash: string;
+    }>(`/api/appeals/${appealId}/status`, token),
 
   getAppeals: (token: string) =>
     fetchApi<{ appeals: any[] }>('/api/appeals', token),
+
+  // Health, which reports whether revocations can actually be enforced.
+  getHealth: () =>
+    fetch(`${API_URL}/api/health`).then((r) => r.json() as Promise<{
+      status: string;
+      contracts: Record<string, string>;
+      host_chain: { chainId: string; sessionKeyRegistry: string | null; guardian: string | null; configured: boolean };
+      appeal_bond_wei: string;
+      relayer: string;
+    }>),
 
   // Stats
   getStats: (token: string) =>

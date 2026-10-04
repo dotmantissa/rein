@@ -1,0 +1,716 @@
+{
+  "name": "ReinSessionKeyRegistry",
+  "compiler": "0.8.26+commit.8a97fa7a.Emscripten.clang",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "initialGuardian",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "CallFailed",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "ceilingWei",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "attemptedTotal",
+          "type": "uint256"
+        }
+      ],
+      "name": "CeilingExceeded",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "DelegationExists",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "escrowWei",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "attempted",
+          "type": "uint256"
+        }
+      ],
+      "name": "EscrowExhausted",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotActive",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotAdmin",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotDelegator",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotGuardian",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotRevoked",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotSessionKey",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "UnknownDelegation",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddress",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroId",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "previous",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "next",
+          "type": "address"
+        }
+      ],
+      "name": "AdminChanged",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "escrowWei",
+          "type": "uint256"
+        }
+      ],
+      "name": "DelegationFunded",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "delegator",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "sessionKey",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "ceilingWei",
+          "type": "uint256"
+        }
+      ],
+      "name": "DelegationOpened",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "appealRef",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "guardian",
+          "type": "address"
+        }
+      ],
+      "name": "DelegationRestored",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "verdictRef",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "guardian",
+          "type": "address"
+        }
+      ],
+      "name": "DelegationRevoked",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "EscrowWithdrawn",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "previous",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "next",
+          "type": "address"
+        }
+      ],
+      "name": "GuardianChanged",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "string",
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "name": "SpendRejected",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "spentWei",
+          "type": "uint256"
+        }
+      ],
+      "name": "Spent",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "admin",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "delegationCount",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "index",
+          "type": "uint256"
+        }
+      ],
+      "name": "delegationIdAt",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "genlayerDelegationId",
+          "type": "string"
+        }
+      ],
+      "name": "delegationIdOf",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "fund",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "getDelegation",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "delegator",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "agent",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "sessionKey",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "ceilingWei",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "spentWei",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "escrowWei",
+              "type": "uint256"
+            },
+            {
+              "internalType": "enum ReinSessionKeyRegistry.State",
+              "name": "state",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "verdictRef",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "appealRef",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint64",
+              "name": "openedAt",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "changedAt",
+              "type": "uint64"
+            }
+          ],
+          "internalType": "struct ReinSessionKeyRegistry.Delegation",
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "guardian",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "isActive",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "sessionKey",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "ceilingWei",
+          "type": "uint256"
+        }
+      ],
+      "name": "openDelegation",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "remainingAllowance",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "appealRef",
+          "type": "bytes32"
+        }
+      ],
+      "name": "restore",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "verdictRef",
+          "type": "bytes32"
+        }
+      ],
+      "name": "revoke",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "next",
+          "type": "address"
+        }
+      ],
+      "name": "setAdmin",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "next",
+          "type": "address"
+        }
+      ],
+      "name": "setGuardian",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes",
+          "name": "data",
+          "type": "bytes"
+        }
+      ],
+      "name": "spend",
+      "outputs": [
+        {
+          "internalType": "bytes",
+          "name": "",
+          "type": "bytes"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "stateOf",
+      "outputs": [
+        {
+          "internalType": "enum ReinSessionKeyRegistry.State",
+          "name": "",
+          "type": "uint8"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "delegationId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawUnspent",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x608060405234801561000f575f80fd5b5060405161163438038061163483398101604081905261002e916100e4565b6001600160a01b0381166100555760405163d92e233d60e01b815260040160405180910390fd5b5f8054336001600160a01b031991821681178355600180549092166001600160a01b038516179091556040519091907f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f908290a36040516001600160a01b038216905f907fa14fc14d8620a708a896fd11392a235647d99385500a295f0d7da2a258b2e967908290a350610111565b5f602082840312156100f4575f80fd5b81516001600160a01b038116811461010a575f80fd5b9392505050565b6115168061011e5f395ff3fe6080604052600436106100fa575f3560e01c8063704b6c0211610092578063c266461011610062578063c2664610146102d5578063c5d6a639146102f4578063d79cd34814610313578063dc2bbed814610332578063f851a44014610345575f80fd5b8063704b6c02146102655780638a0dac4a146102845780638c114fcc146102a3578063bf14c119146102c2575f80fd5b806351b80dfc116100cd57806351b80dfc146101b85780635c36901c146101e45780635f2dae521461021357806364482ac414610227575f80fd5b80631b5a9d68146100fe57806328cc1c7f1461011f5780633eea5fa014610154578063452a932014610181575b5f80fd5b348015610109575f80fd5b5061011d6101183660046111a1565b610363565b005b34801561012a575f80fd5b5061013e610139366004611221565b61048c565b60405161014b9190611284565b60405180910390f35b34801561015f575f80fd5b5061017361016e3660046112b9565b610750565b60405190815260200161014b565b34801561018c575f80fd5b506001546101a0906001600160a01b031681565b6040516001600160a01b03909116815260200161014b565b3480156101c3575f80fd5b506101d76101d23660046112f8565b610772565b60405161014b9190611343565b3480156101ef575f80fd5b506102036101fe3660046112f8565b6108d3565b604051901515815260200161014b565b34801561021e575f80fd5b50600354610173565b348015610232575f80fd5b506102586102413660046112f8565b5f9081526002602052604090206006015460ff1690565b60405161014b9190611414565b348015610270575f80fd5b5061011d61027f366004611422565b610904565b34801561028f575f80fd5b5061011d61029e366004611422565b6109ae565b3480156102ae575f80fd5b506101736102bd3660046112f8565b610a5a565b61011d6102d03660046112f8565b610b9a565b3480156102e0575f80fd5b5061011d6102ef3660046111a1565b610c41565b3480156102ff575f80fd5b5061011d61030e3660046111a1565b610d61565b34801561031e575f80fd5b5061017361032d3660046112f8565b610ec0565b61011d610340366004611442565b610ee4565b348015610350575f80fd5b505f546101a0906001600160a01b031681565b6001546001600160a01b0316331461038e576040516377b6878160e11b815260040160405180910390fd5b5f82815260026020526040812090600682015460ff1660028111156103b5576103b561130f565b036103d35760405163084ac2f160e31b815260040160405180910390fd5b6002600682015460ff1660028111156103ee576103ee61130f565b1461040c576040516339fbd58f60e11b815260040160405180910390fd5b60068101805460ff191660011790556008810182905560098101805467ffffffffffffffff4216600160401b0267ffffffffffffffff60401b199091161790556040805183815233602082015284917f862885afb9588ed5b02fad9a9360a4b0996aa1d71c3bb4772558472a71ad8e6291015b60405180910390a2505050565b5f858152600260205260408120606091600682015460ff1660028111156104b5576104b561130f565b036104d35760405163084ac2f160e31b815260040160405180910390fd5b60028101546001600160a01b0316331461050057604051631528434960e31b815260040160405180910390fd5b6001600682015460ff16600281111561051b5761051b61130f565b146105b257856001600160a01b0316877f77132782871239bc9b139bf9e7e87a948a4cbe5b0a91f19003c83ec108928dc887604051610591918152604060208201819052601a908201527f64656c65676174696f6e207265766f6b6564206279205245494e000000000000606082015260800190565b60405180910390a3604051634065aaf160e11b815260040160405180910390fd5b6001600160a01b0386166105d95760405163d92e233d60e01b815260040160405180910390fd5b5f8582600401546105ea9190611497565b90508160030154811115610626576003820154604051631604695560e31b81526004810191909152602481018290526044015b60405180910390fd5b816005015486111561065b5760058201546040516320c3eebf60e11b815260048101919091526024810187905260440161061d565b80826004018190555085826005015f82825461067791906114aa565b925050819055505f80886001600160a01b031688888860405161069b9291906114bd565b5f6040518083038185875af1925050503d805f81146106d5576040519150601f19603f3d011682016040523d82523d5f602084013e6106da565b606091505b5091509150816106fd57604051633204506f60e01b815260040160405180910390fd5b60408051898152602081018590526001600160a01b038b16918c917f540c552375df23f46a860eead8c3d4751224ee80eb6571ac92c5df2364bf2546910160405180910390a39998505050505050505050565b5f82826040516107619291906114bd565b604051809103902090505b92915050565b60408051610160810182525f80825260208201819052918101829052606081018290526080810182905260a0810182905260c0810182905260e08101829052610100810182905261012081018290526101408101919091525f82815260026020818152604080842081516101608101835281546001600160a01b039081168252600183015481169482019490945281850154909316918301919091526003810154606083015260048101546080830152600581015460a083015260068101549192909160c084019160ff9091169081111561084f5761084f61130f565b60028111156108605761086061130f565b8152600782015460208201526008820154604082015260099091015467ffffffffffffffff8082166060840152600160401b9091041660809091015290505f8160c0015160028111156108b5576108b561130f565b0361076c5760405163084ac2f160e31b815260040160405180910390fd5b5f60015f8381526002602081905260409091206006015460ff16908111156108fd576108fd61130f565b1492915050565b5f546001600160a01b0316331461092e57604051637bfa4b9f60e01b815260040160405180910390fd5b6001600160a01b0381166109555760405163d92e233d60e01b815260040160405180910390fd5b5f80546040516001600160a01b03808516939216917f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f91a35f80546001600160a01b0319166001600160a01b0392909216919091179055565b5f546001600160a01b031633146109d857604051637bfa4b9f60e01b815260040160405180910390fd5b6001600160a01b0381166109ff5760405163d92e233d60e01b815260040160405180910390fd5b6001546040516001600160a01b038084169216907fa14fc14d8620a708a896fd11392a235647d99385500a295f0d7da2a258b2e967905f90a3600180546001600160a01b0319166001600160a01b0392909216919091179055565b5f81815260026020818152604080842081516101608101835281546001600160a01b039081168252600183015481169482019490945281850154909316918301919091526003810154606083015260048101546080830152600581015460a08301526006810154849360c084019160ff1690811115610adb57610adb61130f565b6002811115610aec57610aec61130f565b8152600782015460208201526008820154604082015260099091015467ffffffffffffffff8082166060840152600160401b90910416608090910152905060018160c001516002811115610b4257610b4261130f565b14610b4f57505f92915050565b5f8160800151826060015111610b65575f610b79565b81608001518260600151610b7991906114aa565b90508160a001518110610b90578160a00151610b92565b805b949350505050565b5f81815260026020526040812090600682015460ff166002811115610bc157610bc161130f565b03610bdf5760405163084ac2f160e31b815260040160405180910390fd5b34816005015f828254610bf29190611497565b9091555050600581015460405183917f65289e59afba4cf099b7df6ba7f387d35616f726bcaf6bde489d4039adcbec9291610c3591348252602082015260400190565b60405180910390a25050565b6001546001600160a01b03163314610c6c576040516377b6878160e11b815260040160405180910390fd5b5f82815260026020526040812090600682015460ff166002811115610c9357610c9361130f565b03610cb15760405163084ac2f160e31b815260040160405180910390fd5b6001600682015460ff166002811115610ccc57610ccc61130f565b14610cea57604051634065aaf160e11b815260040160405180910390fd5b60068101805460ff191660021790556007810182905560098101805467ffffffffffffffff4216600160401b0267ffffffffffffffff60401b199091161790556040805183815233602082015284917fcf71cfcfde7450a8e3275e666dc4c795d3e25d0a3381f9db4bd50d54e05e83ab910161047f565b5f82815260026020526040812090600682015460ff166002811115610d8857610d8861130f565b03610da65760405163084ac2f160e31b815260040160405180910390fd5b80546001600160a01b03163314610dd0576040516324e5af8d60e21b815260040160405180910390fd5b8060050154821115610e055760058101546040516320c3eebf60e11b815260048101919091526024810183905260440161061d565b81816005015f828254610e1891906114aa565b90915550506040515f90339084908381818185875af1925050503d805f8114610e5c576040519150601f19603f3d011682016040523d82523d5f602084013e610e61565b606091505b5050905080610e8357604051633204506f60e01b815260040160405180910390fd5b604051838152339085907fada9b39efdfbda90abae579a1389dd62601dc40dad39f12f175a1666dbfa835a9060200160405180910390a350505050565b5f60038281548110610ed457610ed46114cc565b905f5260205f2001549050919050565b83610f025760405163ac8fb3c160e01b815260040160405180910390fd5b6001600160a01b0383161580610f1f57506001600160a01b038216155b15610f3d5760405163d92e233d60e01b815260040160405180910390fd5b5f84815260026020819052604082206006015460ff1690811115610f6357610f6361130f565b14610f81576040516321a6d6e360e11b815260040160405180910390fd5b60408051610160810182523381526001600160a01b038581166020808401918252868316848601908152606085018781525f608087018181523460a08901908152600160c08a0181815260e08b018590526101008b0185905267ffffffffffffffff42166101208c018190526101408c01528f85526002978890529a90932089518154908a166001600160a01b031991821617825597518185018054918b16918a1691909117905594518587018054919099169716969096179096559051600383015593516004820155915160058301559351600682018054949592949193909260ff199290921691849081111561107b5761107b61130f565b021790555060e082015160078201556101008201516008820155610120820151600990910180546101409093015167ffffffffffffffff908116600160401b026fffffffffffffffffffffffffffffffff19909416921691909117919091179055600380546001810182555f919091527fc2575a0e9e593c00f959f8c92f12db2869c3395a3b0502d05e2516446f71f85b01849055604080516001600160a01b03848116825260208201849052851691339187917fa5891f30588e017e0e26ea121bfeba7ac6720658504394d50686c54a1ae159b5910160405180910390a4341561119b576040805134808252602082015285917f65289e59afba4cf099b7df6ba7f387d35616f726bcaf6bde489d4039adcbec92910160405180910390a25b50505050565b5f80604083850312156111b2575f80fd5b50508035926020909101359150565b80356001600160a01b03811681146111d7575f80fd5b919050565b5f8083601f8401126111ec575f80fd5b50813567ffffffffffffffff811115611203575f80fd5b60208301915083602082850101111561121a575f80fd5b9250929050565b5f805f805f60808688031215611235575f80fd5b85359450611245602087016111c1565b935060408601359250606086013567ffffffffffffffff811115611267575f80fd5b611273888289016111dc565b969995985093965092949392505050565b602081525f82518060208401528060208501604085015e5f604082850101526040601f19601f83011684010191505092915050565b5f80602083850312156112ca575f80fd5b823567ffffffffffffffff8111156112e0575f80fd5b6112ec858286016111dc565b90969095509350505050565b5f60208284031215611308575f80fd5b5035919050565b634e487b7160e01b5f52602160045260245ffd5b6003811061133f57634e487b7160e01b5f52602160045260245ffd5b9052565b81516001600160a01b031681526101608101602083015161136f60208401826001600160a01b03169052565b50604083015161138a60408401826001600160a01b03169052565b50606083015160608301526080830151608083015260a083015160a083015260c08301516113bb60c0840182611323565b5060e083015160e08301526101008301516101008301526101208301516113ef61012084018267ffffffffffffffff169052565b5061014083015161140d61014084018267ffffffffffffffff169052565b5092915050565b6020810161076c8284611323565b5f60208284031215611432575f80fd5b61143b826111c1565b9392505050565b5f805f8060808587031215611455575f80fd5b84359350611465602086016111c1565b9250611473604086016111c1565b9396929550929360600135925050565b634e487b7160e01b5f52601160045260245ffd5b8082018082111561076c5761076c611483565b8181038181111561076c5761076c611483565b818382375f9101908152919050565b634e487b7160e01b5f52603260045260245ffdfea264697066735822122060d532b31669712b73fa9eb41178cce80b403f110ead55a4ca74c0d93ff1d0f664736f6c634300081a0033",
+  "eventTopics": {
+    "DelegationRevoked": "0xcf71cfcfde7450a8e3275e666dc4c795d3e25d0a3381f9db4bd50d54e05e83ab",
+    "DelegationRestored": "0x862885afb9588ed5b02fad9a9360a4b0996aa1d71c3bb4772558472a71ad8e62",
+    "DelegationOpened": "0xa5891f30588e017e0e26ea121bfeba7ac6720658504394d50686c54a1ae159b5"
+  },
+  "selectors": {
+    "isActive": "0x5c36901c",
+    "stateOf": "0x64482ac4"
+  }
+}
