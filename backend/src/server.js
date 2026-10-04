@@ -258,7 +258,7 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
         spend_ceiling_wei || "0",
         chain,
         session_key_id,
-        hostRegistryAddress,
+        hostRegistryAddress(),
       ],
       { requireFinality: false, budgetMs: SUBMIT_BUDGET_MS }
     );
@@ -333,7 +333,7 @@ app.post("/api/mandates", requireAuth, async (req, res) => {
         txHash,
         CONTRACTS.mandateRegistry,
         req.user?.email || "",
-        hostRegistryAddress,
+        hostRegistryAddress(),
         latestMandate.host_delegation_id || delegationHandle(delegationId),
         hostOpen?.hash || null,
         hostOpen?.mined && hostOpen.status === 1 ? "OPEN" : "PENDING",
